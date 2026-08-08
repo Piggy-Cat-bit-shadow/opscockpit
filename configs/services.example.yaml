@@ -1,0 +1,80 @@
+# services.yaml — service registry and override.
+#
+# This is NOT a topology definition file. It only declares which business
+# services are worth showing and gives the collectors hints. Runtime truth
+# (listeners, memory, status) always comes from the Linux runtime via ss,
+# /proc, cgroup, systemd, Docker — never from this file.
+#
+# The collect step maps listeners to services by PID → cgroup → systemd unit
+# → service id. services.yaml supplies friendly names, config path overrides,
+# version commands, restart permission and health hints.
+#
+# Copy this file to ./services.yaml (or point opscockpit at it with
+# -services) and adjust the ids/units to match your host.
+
+services:
+
+  - id: nginx
+    name: Nginx
+    systemd:
+      unit: nginx.service
+    config_paths:
+      - /etc/nginx/nginx.conf
+    version:
+      command:
+        - /usr/sbin/nginx
+        - -V
+      timeout: 5s
+    restart_enabled: true
+
+  - id: hysteria2
+    name: Hysteria2
+    systemd:
+      unit: hysteria-server.service
+    config_paths:
+      - /etc/hysteria/config.yaml
+    version:
+      command:
+        - /usr/local/bin/hysteria
+        - version
+      timeout: 5s
+    restart_enabled: true
+
+  - id: tuic
+    name: TUIC
+    systemd:
+      unit: tuic.service
+    config_paths:
+      - /etc/tuic/config.json
+    version:
+      command:
+        - /usr/local/bin/tuic
+        - --version
+      timeout: 5s
+    restart_enabled: true
+
+  - id: adguard-home
+    name: AdGuard Home
+    systemd:
+      unit: adguard.service
+    config_paths:
+      - /etc/AdGuardHome/AdGuardHome.yaml
+    version:
+      command:
+        - /opt/AdGuardHome/AdGuardHome
+        - --version
+      timeout: 5s
+    restart_enabled: true
+
+  - id: xray
+    name: Xray
+    systemd:
+      unit: xray.service
+    config_paths:
+      - /etc/xray/config.json
+    version:
+      command:
+        - /usr/local/bin/xray
+        - version
+      timeout: 5s
+    restart_enabled: true
