@@ -1,0 +1,6 @@
+tcp   LISTEN 0      511    0.0.0.0:443        0.0.0.0:*      users:(("nginx",pid=1001,fd=10))
+udp   UNCONN 0      0      [::]:443           [::]:*         users:(("hysteria",pid=2002,fd=7))
+udp   UNCONN 0      0      [::]:8443          [::]:*         users:(("tuic",pid=3003,fd=9))
+tcp   LISTEN 0      128    0.0.0.0:853        0.0.0.0:*      users:(("adguard",pid=4004,fd=6))
+udp   UNCONN 0      0      0.0.0.0:853        0.0.0.0:*      users:(("adguard",pid=4004,fd=8))
+tcp   LISTEN 0      128    127.0.0.1:18444    0.0.0.0:*      users:(("xray",pid=5005,fd=12))

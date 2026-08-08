@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/opscockpit/opscockpit/internal/collector/cgroup"
@@ -37,6 +38,8 @@ type Options struct {
 	HostSource host.Source
 	// CgroupSource is the pretend "/" for cgroup reads. Empty uses the real root.
 	CgroupSource cgroup.Source
+	// FixtureRoot, when set, prefixes config path existence checks (mock mode).
+	FixtureRoot string
 	// CPUIntervalMs controls the two-sample CPU window.
 	CPUIntervalMs int
 	// ServicesPath is the services.yaml path ("" skips registry).
@@ -272,6 +275,10 @@ func configMissing(opts Options, entry *state.Service) bool {
 func configExists(opts Options, path string) bool {
 	if opts.ConfigExists != nil {
 		return opts.ConfigExists(path)
+	}
+	if opts.FixtureRoot != "" {
+		_, err := os.Stat(filepath.Join(opts.FixtureRoot, path))
+		return err == nil
 	}
 	_, err := os.Stat(path)
 	return err == nil

@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/opscockpit/opscockpit/internal/collect"
@@ -74,14 +77,48 @@ func cmdCollect(args []string) error {
 	servicesPath := fs.String("services", "services.yaml", "path to services.yaml")
 	statePath := fs.String("out", "state.json", "path to write state.json")
 	cpuInterval := fs.Int("cpu-interval-ms", 100, "CPU sample interval in ms")
+	fixtureRoot := fs.String("root", "", "fixture root for /proc and cgroup reads (dev/test; empty = real host)")
 	_ = fs.Parse(args)
 
 	ctx := context.Background()
 	pr := collect.NewProductionRunner()
 
+	hs := host.Source{}
+	cs := cgroup.Source{}
+	if *fixtureRoot != "" {
+		hs = host.FromDir(*fixtureRoot)
+		cs = cgroup.FromDir(*fixtureRoot)
+		// Fixture mode: map PIDs to services by scanning cgroup.procs files.
+		pidSvc := map[int]string{}
+		if cfg, err := svc.Load(*servicesPath); err == nil {
+			for _, s := range cfg.Services {
+				unit := s.Unit()
+				if unit == "" {
+					continue
+				}
+				rel := "sys/fs/cgroup/system.slice/" + unit
+				pids, err := os.ReadFile(filepath.Join(*fixtureRoot, rel, "cgroup.procs"))
+				if err != nil {
+					continue
+				}
+				for _, line := range strings.Split(string(pids), "\n") {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					if pid, err := strconv.Atoi(line); err == nil {
+						pidSvc[pid] = s.ID
+					}
+				}
+			}
+		}
+		pr.SetPIDResolver(func(pid int) string { return pidSvc[pid] })
+	}
+
 	res, err := collect.Collect(ctx, pr, collect.Options{
-		HostSource:    host.Source{},
-		CgroupSource:  cgroup.Source{},
+		HostSource:    hs,
+		CgroupSource:  cs,
+		FixtureRoot:   *fixtureRoot,
 		ServicesPath:  *servicesPath,
 		StatePath:     *statePath,
 		CPUIntervalMs: *cpuInterval,

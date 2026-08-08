@@ -148,9 +148,8 @@ func TestServiceStatusRules(t *testing.T) {
 	if s, p := ServiceStatus(true, "active", []string{"tcp/443"}, false); s != StatusFailed || len(p) != 1 {
 		t.Fatalf("missing listener case: got %q %v", s, p)
 	}
-	// missing config override → warning per spec, but our model treats it as a
-	// problem; assert the problem list is non-empty (spec: config path unknown → warning)
-	if s, p := ServiceStatus(true, "active", nil, true); s != StatusFailed || len(p) != 1 {
+	// missing config override → warning (spec: config path unknown → warning)
+	if s, p := ServiceStatus(true, "active", nil, true); s != StatusWarning || len(p) != 1 {
 		t.Fatalf("missing config case: got %q %v", s, p)
 	}
 }

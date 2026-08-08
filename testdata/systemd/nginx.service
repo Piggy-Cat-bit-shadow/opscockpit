@@ -1,0 +1,7 @@
+ActiveState=active
+SubState=running
+MainPID=1001
+ControlGroup=/system.slice/nginx.service
+FragmentPath=/etc/systemd/system/nginx.service
+Result=success
+LoadState=loaded

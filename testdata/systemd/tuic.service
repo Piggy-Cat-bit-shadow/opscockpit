@@ -1,0 +1,7 @@
+ActiveState=active
+SubState=running
+MainPID=3003
+ControlGroup=/system.slice/tuic.service
+FragmentPath=/etc/systemd/system/tuic.service
+Result=success
+LoadState=loaded

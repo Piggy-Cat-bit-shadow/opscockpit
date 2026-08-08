@@ -1,0 +1,7 @@
+ActiveState=active
+SubState=running
+MainPID=4004
+ControlGroup=/system.slice/adguard.service
+FragmentPath=/etc/systemd/system/adguard.service
+Result=success
+LoadState=loaded

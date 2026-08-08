@@ -4,7 +4,10 @@ package collect
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -40,8 +43,25 @@ func (r *ProductionRunner) Run(ctx context.Context, argv []string) (string, erro
 	return string(out), err
 }
 
-// RunUnit runs `systemctl show <unit> --property=...`.
+// RunUnit runs `systemctl show <unit> --property=...`. When
+// OPSCOCKPIT_UNIT_DIR is set (fixture mode), it reads a per-unit text file
+// (one `Key=value` per line) from that directory instead of running systemctl.
 func (r *ProductionRunner) RunUnit(ctx context.Context, unit string, properties []string) (string, error) {
+	if d := os.Getenv("OPSCOCKPIT_UNIT_DIR"); d != "" {
+		b, err := os.ReadFile(filepath.Join(d, unit))
+		if err != nil {
+			return "", err
+		}
+		// systemctl show requires all requested properties; default empties.
+		var out strings.Builder
+		for _, p := range properties {
+			out.WriteString(p)
+			out.WriteString("=")
+			out.WriteString(lookupKV(string(b), p))
+			out.WriteString("\n")
+		}
+		return out.String(), nil
+	}
 	bin := r.Systemctl
 	if bin == "" {
 		bin = "systemctl"
@@ -61,8 +81,25 @@ func (r *ProductionRunner) RunUnit(ctx context.Context, unit string, properties 
 	return string(out), err
 }
 
-// SS runs `ss -H -lntup`.
+func lookupKV(content, key string) string {
+	for _, line := range strings.Split(content, "\n") {
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) == 2 && strings.TrimSpace(kv[0]) == key {
+			return strings.TrimSpace(kv[1])
+		}
+	}
+	return ""
+}
+
+// SS runs `ss -H -lntup`. When OPSCOCKPIT_SS_FILE is set (fixture mode), it
+// reads ss output from that file instead of running the real ss. This lets the
+// production binary be exercised against fixture data (mockdemo) with no code
+// changes to the collect pipeline.
 func (r *ProductionRunner) SS(ctx context.Context) (string, error) {
+	if f := os.Getenv("OPSCOCKPIT_SS_FILE"); f != "" {
+		b, err := os.ReadFile(f)
+		return string(b), err
+	}
 	bin := r.SSCommand
 	if bin == "" {
 		bin = "ss"

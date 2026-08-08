@@ -40,31 +40,28 @@ func IsKnownStatus(s string) bool {
 //
 // Rules:
 //   - Version unknown is NOT a problem.
-//   - A service unit that failed/stopped is failed.
+//   - A service unit that is not active is failed.
 //   - An active unit missing a required listener is failed.
-//   - Config path override missing is a warning.
-//   - Otherwise healthy.
+//   - Config path override missing is a warning (not a failure).
 func ServiceStatus(unitActive bool, unitState string, requiredMissing []string, configOverrideMissing bool) (string, []string) {
-	var problems []string
-
 	if !unitActive {
 		state := unitState
 		if state == "" {
 			state = "inactive"
 		}
-		problems = append(problems, "unit not active ("+state+")")
+		return StatusFailed, []string{"unit not active (" + state + ")"}
 	}
 
+	var warnings []string
 	for _, r := range requiredMissing {
-		problems = append(problems, "required listener missing: "+r)
+		warnings = append(warnings, "required listener missing: "+r)
+	}
+	if len(warnings) > 0 {
+		return StatusFailed, warnings
 	}
 
 	if configOverrideMissing {
-		problems = append(problems, "config path not found")
-	}
-
-	if len(problems) > 0 {
-		return StatusFailed, problems
+		return StatusWarning, []string{"config path not found"}
 	}
 
 	return StatusHealthy, nil

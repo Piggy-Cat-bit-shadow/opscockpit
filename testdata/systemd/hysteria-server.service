@@ -1,0 +1,7 @@
+ActiveState=active
+SubState=running
+MainPID=2002
+ControlGroup=/system.slice/hysteria-server.service
+FragmentPath=/etc/systemd/system/hysteria-server.service
+Result=success
+LoadState=loaded
