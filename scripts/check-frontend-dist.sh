@@ -18,24 +18,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FINGERPRINT="$ROOT/frontend-build.json"
 UPSTREAM_COMMIT="f07f43686ec05f586bebe476b889a47137d2af2d"
 
-# Source files that produce the dist (exclude generated output).
-SRC_FILES=(
-  frontend/package.json
-  frontend/vite.config.ts
-  frontend/index.html
-  frontend/tsconfig.json
-  frontend/tsconfig.app.json
-  frontend/tsconfig.node.json
-  frontend/src
-)
-
 source_hash() {
-  # Deterministic hash across the listed source paths.
-  (cd "$ROOT" && tar cf - "${SRC_FILES[@]}" 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
+  # Content-only, cross-platform deterministic hash (macOS BSD find/tar and
+  # Linux GNU tools differ in archive headers — never use tar here). Sort the
+  # path list, hash each file's content, then hash the aggregate output.
+  (cd "$ROOT" && {
+    echo "frontend/package.json"
+    echo "frontend/vite.config.ts"
+    echo "frontend/index.html"
+    echo "frontend/tsconfig.json"
+    echo "frontend/tsconfig.app.json"
+    echo "frontend/tsconfig.node.json"
+    find frontend/src -type f
+  } | sort | xargs shasum -a 256 | shasum -a 256 | cut -d' ' -f1)
 }
 
 dist_hash() {
-  # Hash of the committed dist that Go embeds.
+  # Hash of the committed dist that Go embeds (same content-only pattern).
   (cd "$ROOT" && find internal/web/dist -type f | sort | xargs shasum -a 256 | shasum -a 256 | cut -d' ' -f1)
 }
 
@@ -55,15 +54,23 @@ EOF
   echo "wrote $FINGERPRINT"
 }
 
+refresh_fingerprint() {
+  write_fingerprint
+  echo "done. commit frontend-build.json."
+  exit 0
+}
+
 if [[ "${1:-}" == "--fix" ]]; then
   echo "rebuilding frontend…"
   (cd "$ROOT/frontend" && npm ci --silent && npm run build)
   rm -rf "$ROOT/internal/web/dist"
   mkdir -p "$ROOT/internal/web/dist"
   cp -R "$ROOT/frontend/dist/." "$ROOT/internal/web/dist/"
-  write_fingerprint
-  echo "done. commit internal/web/dist and frontend-build.json."
-  exit 0
+  refresh_fingerprint
+fi
+
+if [[ "${1:-}" == "--refresh" ]]; then
+  refresh_fingerprint
 fi
 
 if [[ ! -f "$FINGERPRINT" ]]; then
