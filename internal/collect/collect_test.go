@@ -344,11 +344,15 @@ func TestCollectSecretExclusion(t *testing.T) {
 	os.MkdirAll(filepath.Join(cfgDir, "etc", "hysteria"), 0o755)
 	os.WriteFile(filepath.Join(cfgDir, "etc", "hysteria", "config.yaml"),
 		[]byte("password: abc\ntoken: 123\nuuid: xxx\nprivate_key: ...\nsecret: ...\n"), 0o644)
+	// A hermetic /proc root so host numbers never vary across CI runners.
+	writeFixtureProc(t, filepath.Join(cfgDir, "root"))
 
 	statePath := filepath.Join(cfgDir, "state.json")
 	res, err := Collect(context.Background(), r, Options{
-		ServicesPath: mockServicesPath(t),
-		StatePath:    statePath,
+		HostSource:    host.FromDir(filepath.Join(cfgDir, "root")),
+		CgroupSource:  cgroup.FromDir(filepath.Join(cfgDir, "root")),
+		ServicesPath:  mockServicesPath(t),
+		StatePath:     statePath,
 	})
 	if err != nil {
 		t.Fatalf("collect: %v", err)
@@ -358,9 +362,35 @@ func TestCollectSecretExclusion(t *testing.T) {
 	}
 
 	raw, _ := os.ReadFile(statePath)
-	for _, bad := range []string{"password", "token", "uuid", "private_key", "secret", "abc", "123"} {
+	// Secret field NAMES must never appear. Value substrings are covered by
+	// Validate()'s structural allowlist scan; checking bare numbers like "123"
+	// would false-positive on legitimate host numbers.
+	for _, bad := range []string{"password", "token", "uuid", "private_key", "secret"} {
 		if bytesContains(raw, bad) {
-			t.Errorf("state.json contains leaked %q", bad)
+			t.Errorf("state.json contains leaked secret field %q", bad)
+		}
+	}
+}
+
+// writeFixtureProc writes a minimal /proc root used to keep host collection
+// deterministic (CPU/mem/load/uptime) instead of reading the real host.
+func writeFixtureProc(t *testing.T, root string) {
+	t.Helper()
+	files := map[string]string{
+		"proc/sys/kernel/hostname": "fixture-host\n",
+		"proc/uptime":              "3600.00 100.00\n",
+		"proc/loadavg":             "0.10 0.20 0.30 1/100 1234\n",
+		"proc/stat":                "cpu  1000 0 500 9000 100 0 50 0 0 0\ncpu0 1 2 3 4\n",
+		"proc/meminfo":             "MemTotal: 1024000 kB\nMemFree: 200000 kB\nMemAvailable: 300000 kB\n",
+		"proc/self/fixture_disk":   "1000000000 250000000\n",
+	}
+	for rel, content := range files {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
