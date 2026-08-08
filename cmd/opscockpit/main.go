@@ -198,56 +198,96 @@ func cmdDiscover(args []string) error {
 	return nil
 }
 
+// Production helper constants — fixed inside the root helper, never exposed
+// as privileged CLI flags. A sudo caller cannot influence any of these.
+const (
+	// helperServicesPath is the fixed root-owned registry the helper re-reads.
+	helperServicesPath = "/etc/opscockpit/services.yaml"
+	// helperCollectUnit is the fixed unit started for an immediate collect.
+	helperCollectUnit = "opscockpit-collect.service"
+	// helperRestartTimeout bounds the systemctl/docker restart.
+	helperRestartTimeout = 20 * time.Second
+)
+
+// helperConfig allows tests to inject paths/runner without exposing privileged
+// CLI flags. Production uses the fixed constants above.
+type helperConfig struct {
+	servicesPath string
+	collectUnit  string
+	timeout      time.Duration
+	runCmd       func(ctx context.Context, name string, args ...string) error
+	// verifyRootOwned checks the services registry ownership. Defaults to
+	// requireRootOwned. Tests inject a stub (the real check is exercised by
+	// dedicated ownership tests where the filesystem is set up accordingly).
+	verifyRootOwned func(path string) error
+}
+
+func defaultHelperConfig() helperConfig {
+	return helperConfig{
+		servicesPath:    helperServicesPath,
+		collectUnit:     helperCollectUnit,
+		timeout:         helperRestartTimeout,
+		runCmd:          runHelperCmd,
+		verifyRootOwned: requireRootOwned,
+	}
+}
+
 // cmdRestartHelper is the root-only restart executor invoked by serve via
-// `sudo -n opscockpit restart-helper --services <path> <id>`. It is the SECOND
-// trust boundary: it re-reads the root-owned services.yaml, re-checks
-// restart_enabled, and resolves the exact unit/container itself. Nothing from
-// the web/state.json is trusted.
+// `sudo -n opscockpit restart-helper <service_id>`. It accepts EXACTLY ONE
+// positional service id — no flags, no --services, no --trigger-collect, no
+// extra arguments. It is the SECOND trust boundary: it re-reads the root-owned
+// services.yaml, re-checks restart_enabled, and resolves the exact
+// unit/container itself. Nothing from the web/state.json is trusted.
 func cmdRestartHelper(args []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("restart-helper must run as root (euid=0)")
 	}
-	fs := flag.NewFlagSet("restart-helper", flag.ExitOnError)
-	servicesPath := fs.String("services", "", "root-owned services.yaml path")
-	timeout := fs.Duration("timeout", 20*time.Second, "systemctl/docker restart timeout")
-	triggerCollect := fs.String("trigger-collect", "opscockpit-collect.service",
-		"systemd unit to start for an immediate collect after restart ('' disables)")
-	_ = fs.Parse(args)
-	if *servicesPath == "" {
-		return fmt.Errorf("restart-helper requires --services path")
+	return cmdRestartHelperWith(append([]string{}, args...), defaultHelperConfig())
+}
+
+// cmdRestartHelperWith is the testable core. The privileged CLI exposes no
+// flags; the fixed production paths are constants. The euid=0 gate lives in
+// cmdRestartHelper (the CLI entry), not here.
+func cmdRestartHelperWith(args []string, hc helperConfig) error {
+	// Strict argument contract: exactly one positional arg, no flags.
+	if len(args) != 1 {
+		return fmt.Errorf("restart-helper requires exactly one service id (no flags, no extra arguments)")
 	}
-	// Exactly one positional service id.
-	if fs.NArg() != 1 {
-		return fmt.Errorf("restart-helper requires exactly one service id")
+	id := args[0]
+	if !restart.ServiceIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid service id")
 	}
-	id := fs.Arg(0)
+	if strings.HasPrefix(id, "-") {
+		return fmt.Errorf("invalid service id")
+	}
 
 	// Second trust boundary: re-read the root-owned registry and resolve the
 	// exact unit/container. Nothing from state.json or the web is trusted.
-	kind, target, err := resolveRestartTarget(*servicesPath, id)
+	kind, target, err := resolveRestartTarget(hc.servicesPath, id, hc.verifyRootOwned)
 	if err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), hc.timeout)
 	defer cancel()
 
 	switch kind {
 	case "unit":
-		if err := runHelperCmd(ctx, "systemctl", "restart", target); err != nil {
+		if err := hc.runCmd(ctx, "systemctl", "restart", target); err != nil {
 			return fmt.Errorf("systemctl restart %s: %w", target, err)
 		}
 	case "container":
-		if err := runHelperCmd(ctx, "docker", "restart", target); err != nil {
+		if err := hc.runCmd(ctx, "docker", "restart", target); err != nil {
 			return fmt.Errorf("docker restart %s: %w", target, err)
 		}
 	default:
 		return fmt.Errorf("service %q has no restart target", id)
 	}
 
-	// Optional immediate collect trigger (fixed unit name, not user-supplied).
-	if *triggerCollect != "" {
-		_ = runHelperCmd(ctx, "systemctl", "start", *triggerCollect)
+	// Fixed immediate collect trigger (internal deployment constant). Failure
+	// must not turn a successful service restart into a failure.
+	if hc.collectUnit != "" {
+		_ = hc.runCmd(ctx, "systemctl", "start", hc.collectUnit)
 	}
 	return nil
 }
@@ -257,15 +297,17 @@ func cmdRestartHelper(args []string) error {
 // boundary: nothing from state.json or the web is trusted. Returns ("unit", u)
 // or ("container", c); ("", "") when the service has no restart target.
 //
-// The services file must be root-owned and not writable by non-root users;
-// otherwise a non-root caller could point the helper at a file that grants an
-// arbitrary unit/container and escalate to restarting any service.
-func resolveRestartTarget(servicesPath, id string) (kind, target string, err error) {
+// verifyRootOwned must be non-nil; production passes requireRootOwned (the
+// registry must be a root-owned, non-writable regular file whose parent dir is
+// also root-owned). Tests inject a stub for positive resolution cases.
+func resolveRestartTarget(servicesPath, id string, verifyRootOwned func(string) error) (kind, target string, err error) {
 	if !restart.ServiceIDPattern.MatchString(id) {
 		return "", "", fmt.Errorf("invalid service id")
 	}
-	if err := requireRootOwned(servicesPath); err != nil {
-		return "", "", err
+	if verifyRootOwned != nil {
+		if err := verifyRootOwned(servicesPath); err != nil {
+			return "", "", err
+		}
 	}
 	cfg, err := svc.Load(servicesPath)
 	if err != nil {
@@ -287,16 +329,64 @@ func resolveRestartTarget(servicesPath, id string) (kind, target string, err err
 	return "", "", fmt.Errorf("service %q has no restart target (no systemd unit or docker container)", id)
 }
 
-// requireRootOwned rejects a services.yaml that a non-root user could have
-// written (world-writable, or owned by a non-root uid) — the second boundary
-// is only trustworthy when the registry itself is root-protected.
+// requireRootOwned verifies the services registry is genuinely root-protected:
+//  1. regular file (not a symlink we blindly follow, not a dir/device)
+//  2. owner UID == 0
+//  3. group/world not writable
+//  4. the parent directory is root-owned and group/world not writable
+//
+// A file a non-root user can write (even a user-owned 0600 file) would let a
+// sudo caller point the helper at a forged registry — the helper only trusts a
+// registry a non-root user could not have created.
 func requireRootOwned(path string) error {
-	fi, err := os.Stat(path)
+	if err := requireRootFile(path); err != nil {
+		return err
+	}
+	parent := filepath.Dir(path)
+	if err := requireRootDir(parent); err != nil {
+		return err
+	}
+	return nil
+}
+
+func requireRootFile(path string) error {
+	fi, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat services config: %w", err)
 	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("services config %s is not a regular file", path)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("services config %s: cannot stat owner", path)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("services config %s must be owned by root (uid 0), found uid %d", path, st.Uid)
+	}
 	if fi.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("services config %s is group/world-writable; refusing", path)
+	}
+	return nil
+}
+
+func requireRootDir(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("stat services config directory: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("services config directory %s is not a directory", path)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("services config directory %s: cannot stat owner", path)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("services config directory %s must be owned by root (uid 0), found uid %d", path, st.Uid)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("services config directory %s is group/world-writable; refusing", path)
 	}
 	return nil
 }
@@ -324,14 +414,14 @@ func cmdServe(args []string) error {
 	unixPath := fs.String("unix", "", "unix socket path (preferred for production; empty = TCP)")
 	socketMode := fs.Uint("unix-mode", 0o660, "unix socket file mode (octal)")
 	cooldown := fs.Duration("restart-cooldown", 10*time.Second, "min interval between restarts of the same service")
-	restartHelper := fs.String("restart-helper", "", "root helper binary invoked via sudo (e.g. /usr/local/bin/opscockpit)")
-	restartServices := fs.String("restart-services", "", "root-owned services.yaml the helper re-reads (second allowlist boundary)")
+	restartHelper := fs.String("restart-helper", "", "root helper binary invoked via sudo (e.g. /usr/local/bin/opscockpit); empty disables restart API")
 	restartSudo := fs.Bool("restart-sudo", true, "invoke the helper via sudo -n (production); false for dev")
 	_ = fs.Parse(args)
 
 	// Serve reads ONLY state.json for the restart allowlist — never the
 	// root-owned services.yaml. The unit names in state.json were resolved by
-	// the root collector; serve never parses systemd/Docker/firewall.
+	// the root collector; serve never parses systemd/Docker/firewall. The
+	// helper resolves its fixed /etc/opscockpit/services.yaml internally.
 	var broker *restart.Broker
 	store := server.FileStore{Path: *statePath}
 	allowlist := []restart.Entry{}
@@ -341,16 +431,15 @@ func cmdServe(args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: could not load %s for restart allowlist: %v\n", *statePath, err)
 	}
 
-	if *restartServices == "" {
+	if *restartHelper == "" {
 		// No helper configured: the restart API must return an explicit
 		// "unavailable", never silently succeed via a mock.
-		fmt.Fprintln(os.Stderr, "warning: restart API disabled — set -restart-services (and -restart-helper) to enable")
+		fmt.Fprintln(os.Stderr, "warning: restart API disabled — set -restart-helper to enable")
 		broker = restart.NewBrokerCooldown(allowlist, restart.NewUnavailableBackend(), *cooldown)
 	} else {
 		backend, berr := restart.NewHelperBackend(restart.HelperConfig{
-			Helper:       *restartHelper,
-			ServicesPath: *restartServices,
-			Sudo:         *restartSudo,
+			Helper: *restartHelper,
+			Sudo:   *restartSudo,
 		})
 		if berr != nil {
 			return berr

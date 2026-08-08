@@ -41,10 +41,9 @@ func (r *recordingRunner) Run(ctx context.Context, argv []string) (string, error
 func TestHelperBackendConstructsFixedArgv(t *testing.T) {
 	rec := &recordingRunner{}
 	b, err := NewHelperBackend(HelperConfig{
-		Helper:       "/opt/opscockpit",
-		ServicesPath: "/etc/opscockpit/services.yaml",
-		Sudo:         true,
-		Runner:       rec.Run,
+		Helper: "/opt/opscockpit",
+		Sudo:   true,
+		Runner: rec.Run,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +54,8 @@ func TestHelperBackendConstructsFixedArgv(t *testing.T) {
 	if len(rec.argv) != 1 {
 		t.Fatalf("argv = %v", rec.argv)
 	}
-	want := []string{"sudo", "-n", "/opt/opscockpit", "restart-helper", "--services", "/etc/opscockpit/services.yaml", "hysteria2"}
+	// Exactly: sudo -n <helper> restart-helper <id> — no --services, no flags.
+	want := []string{"sudo", "-n", "/opt/opscockpit", "restart-helper", "hysteria2"}
 	if !equalStrings(rec.argv[0], want) {
 		t.Fatalf("argv = %v, want %v", rec.argv[0], want)
 	}
@@ -64,9 +64,8 @@ func TestHelperBackendConstructsFixedArgv(t *testing.T) {
 func TestHelperBackendNoSudo(t *testing.T) {
 	rec := &recordingRunner{}
 	b, err := NewHelperBackend(HelperConfig{
-		ServicesPath: "/etc/opscockpit/services.yaml",
-		Sudo:         false,
-		Runner:       rec.Run,
+		Sudo:   false,
+		Runner: rec.Run,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -75,11 +74,16 @@ func TestHelperBackendNoSudo(t *testing.T) {
 	if len(rec.argv) != 1 || rec.argv[0][0] == "sudo" {
 		t.Fatalf("no-sudo backend argv = %v", rec.argv)
 	}
+	// Must be exactly [helper restart-helper nginx].
+	want := []string{"/usr/local/bin/opscockpit", "restart-helper", "nginx"}
+	if !equalStrings(rec.argv[0], want) {
+		t.Fatalf("argv = %v, want %v", rec.argv[0], want)
+	}
 }
 
 func TestHelperBackendRejectsInvalidID(t *testing.T) {
 	rec := &recordingRunner{}
-	b, _ := NewHelperBackend(HelperConfig{ServicesPath: "/etc/x", Sudo: false, Runner: rec.Run})
+	b, _ := NewHelperBackend(HelperConfig{Sudo: false, Runner: rec.Run})
 	if err := b.Restart(context.Background(), "evil;rm -rf /"); !errors.Is(err, ErrInvalidID) {
 		t.Fatalf("err = %v, want ErrInvalidID", err)
 	}
@@ -88,15 +92,17 @@ func TestHelperBackendRejectsInvalidID(t *testing.T) {
 	}
 }
 
-func TestHelperBackendMissingServicesPath(t *testing.T) {
-	if _, err := NewHelperBackend(HelperConfig{}); err == nil {
-		t.Fatal("expected error when services path is empty")
+func TestHelperBackendDefaultPath(t *testing.T) {
+	// NewHelperBackend works with no config beyond a runner (production paths
+	// are fixed inside the helper; serve never passes a services path).
+	if _, err := NewHelperBackend(HelperConfig{}); err != nil {
+		t.Fatalf("NewHelperBackend with zero config should succeed, got %v", err)
 	}
 }
 
 func TestHelperBackendErrorsNeverLeakOutput(t *testing.T) {
 	rec := &recordingRunner{err: errors.New("boom")}
-	b, _ := NewHelperBackend(HelperConfig{ServicesPath: "/etc/x", Sudo: false, Runner: rec.Run})
+	b, _ := NewHelperBackend(HelperConfig{Sudo: false, Runner: rec.Run})
 	err := b.Restart(context.Background(), "nginx")
 	if err == nil {
 		t.Fatal("expected error")
@@ -119,9 +125,8 @@ func TestHelperBackendTimeoutBounded(t *testing.T) {
 	// runner is bounded by the config timeout, not left hanging.
 	rec := &recordingRunner{}
 	b, _ := NewHelperBackend(HelperConfig{
-		ServicesPath: "/etc/x",
-		Sudo:         false,
-		Timeout:      10 * time.Millisecond,
+		Sudo:    false,
+		Timeout: 10 * time.Millisecond,
 		Runner: func(ctx context.Context, argv []string) (string, error) {
 			<-ctx.Done()
 			return "", ctx.Err()

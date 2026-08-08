@@ -5,21 +5,34 @@
 #   visudo -cf /etc/sudoers.d/opscockpit
 #
 # Purpose: let the non-root OpsCockpit web user run ONLY the fixed
-# restart-helper with a fixed services.yaml path. The helper itself validates
-# the service id and re-reads the root-owned registry (second allowlist
-# boundary). The web user can never run arbitrary systemctl, docker, bash, sh,
-# or any command — only this exact helper invocation.
+# restart-helper. The helper requires EXACTLY ONE positional service id and
+# rejects every flag; it re-reads its own fixed /etc/opscockpit/services.yaml
+# (second allowlist boundary). The web user can never run arbitrary systemctl,
+# docker, bash, sh, or any command.
 
-# Replace `opsweb` with the actual web service account (decided at deploy time;
-# OpsCockpit does not guess a username).
-opsweb ALL=(root) NOPASSWD: /usr/local/bin/opscockpit restart-helper --services /etc/opscockpit/services.yaml *
+# Replace `opscockpit` with the actual web service account (decided at deploy
+# time; OpsCockpit does not guess a username).
+opscockpit ALL=(root) NOPASSWD: /usr/local/bin/opscockpit restart-helper *
 
-# The `*` matches ONLY the single trailing service-id argument. It is not a
-# wildcard for arbitrary commands: sudoers applies this rule only to the
-# literal binary + fixed subcommand + fixed flag value. The service id is
-# re-validated by the helper's ServiceIDPattern before anything runs.
+# IMPORTANT — the trailing `*` is NOT an argument-count validator.
+# sudoers wildcard matches "anything after the fixed prefix". It grants the
+# caller the ability to pass arbitrary trailing arguments to the helper. The
+# REAL safety comes from the helper itself, which:
+#   - rejects any argv whose length != 1 (no --services, no --trigger-collect,
+#     no --timeout, no extra positional args)
+#   - validates the single id against ^[a-z0-9][a-z0-9._-]*$
+#   - refuses any id starting with '-'
+#   - verifies /etc/opscockpit/services.yaml is a root-owned, non-writable
+#     regular file whose parent dir is also root-owned
+#   - resolves the exact systemd unit / Docker container from that registry
+#
+# Do NOT rely on sudo regex support to enforce the argument contract. On
+# sudoers builds with regex support (Ubuntu >= 22.04) you may additionally
+# restrict the id with a regex, e.g.:
+#   opscockpit ALL=(root) NOPASSWD: /usr/local/bin/opscockpit restart-helper [a-z0-9._-]*
+# but program safety must never depend on a particular sudo regex version.
 
-# Explicitly denied — nothing else is permitted:
-# opsweb ALL=(root) NOPASSWD: /bin/systemctl          # NOT granted
-# opsweb ALL=(root) NOPASSWD: /usr/bin/docker         # NOT granted
-# opsweb ALL=(root) NOPASSWD: /bin/sh, /bin/bash      # NOT granted
+# The web user may NOT run any of the following. They are deliberately absent:
+#   opscockpit ALL=(root) NOPASSWD: /bin/systemctl          # NOT granted
+#   opscockpit ALL=(root) NOPASSWD: /usr/bin/docker         # NOT granted
+#   opscockpit ALL=(root) NOPASSWD: /bin/sh, /bin/bash      # NOT granted

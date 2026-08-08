@@ -1,0 +1,44 @@
+# OpsCockpit serve — systemd unit template (REFERENCE ONLY).
+#
+# Installed during the deployment phase (NOT by this repository or CI).
+# Replace `opscockpit` with the actual service account and confirm the sudoers
+# rule matches (deploy/templates/sudoers.d-opscockpit).
+
+[Unit]
+Description=OpsCockpit runtime dashboard (serve)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Non-root web service account. The binary only reads state.json + the
+# embedded frontend and serves the unix socket; it never reads root-owned
+# services.yaml, systemd, Docker, UFW, iptables, or `ip`.
+User=opscockpit
+Group=opscockpit-web
+
+# RuntimeDirectory creates /run/opscockpit owned by the service account.
+RuntimeDirectory=opscockpit
+RuntimeDirectoryMode=0750
+
+# --- CRITICAL: do NOT set NoNewPrivileges=true here. ---
+# serve must be able to `sudo -n` to the root restart-helper. NoNewPrivileges
+# blocks setuid/sudo privilege escalation at the kernel level, so the restart
+# API would break. Other sandbox hardening is fine as long as it does not
+# break: sudo privilege escalation, the unix socket, state.json reads, or the
+# systemctl/docker helper invocation.
+# NoNewPrivileges=true   # <- DO NOT ADD
+
+ExecStart=/usr/local/bin/opscockpit serve \
+  -state /var/lib/opscockpit/state.json \
+  -unix /run/opscockpit/opscockpit.sock \
+  -unix-mode 0660 \
+  -restart-helper /usr/local/bin/opscockpit \
+  -restart-sudo=true
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

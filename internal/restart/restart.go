@@ -236,10 +236,9 @@ func (u *UnavailableBackend) Restart(ctx context.Context, serviceID string) erro
 // HelperConfig configures the production restart backend.
 type HelperConfig struct {
 	// Helper is the opscockpit binary path used as the helper (default
-	// /usr/local/bin/opscockpit).
+	// /usr/local/bin/opscockpit). The helper itself resolves the fixed
+	// /etc/opscockpit/services.yaml internally — serve never passes a path.
 	Helper string
-	// ServicesPath is the root-owned services.yaml the helper re-reads.
-	ServicesPath string
 	// Sudo forces invocation via `sudo -n` (production). Empty disables sudo
 	// (dev/test direct helper).
 	Sudo bool
@@ -259,11 +258,8 @@ type HelperBackend struct {
 	cfg HelperConfig
 }
 
-// NewHelperBackend builds the production backend. Requires a services path.
+// NewHelperBackend builds the production backend.
 func NewHelperBackend(cfg HelperConfig) (*HelperBackend, error) {
-	if cfg.ServicesPath == "" {
-		return nil, fmt.Errorf("restart helper requires -restart-services path")
-	}
 	if cfg.Helper == "" {
 		cfg.Helper = "/usr/local/bin/opscockpit"
 	}
@@ -278,12 +274,15 @@ func NewHelperBackend(cfg HelperConfig) (*HelperBackend, error) {
 
 // Restart invokes the fixed helper argv:
 //
-//	[sudo -n] <helper> restart-helper --services <path> <serviceID>
+//	[sudo -n] <helper> restart-helper <serviceID>
+//
+// No --services, --timeout, --trigger-collect, or any other caller-influenced
+// flag is passed. The root helper resolves the fixed services path internally.
 func (h *HelperBackend) Restart(ctx context.Context, serviceID string) error {
 	if !ServiceIDPattern.MatchString(serviceID) {
 		return ErrInvalidID
 	}
-	argv := []string{h.cfg.Helper, "restart-helper", "--services", h.cfg.ServicesPath, serviceID}
+	argv := []string{h.cfg.Helper, "restart-helper", serviceID}
 	if h.cfg.Sudo {
 		argv = append([]string{"sudo", "-n"}, argv...)
 	}
