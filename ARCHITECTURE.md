@@ -117,9 +117,11 @@ Internet
 | `systemd` | `systemctl show --property=...` | ActiveState, SubState, MainPID, ControlGroup, ExecStart |
 | `cgroup` | cgroup v2 `memory.current`, `/proc/<pid>/status` VmRSS | per-service memory (cgroup → PID-sum → MainPID fallback) |
 | `listener` | `ss -H -lntup` | protocol, bind address, port, pid, process; public vs internal |
-| `docker` | `docker ps` / `docker inspect` | container id, name, image, status, published ports, memory, labels |
-| `firewall` | `LC_ALL=C ufw status verbose` | UFW active/inactive, default policy, ingress ALLOW rules (single port, range, IPv4/v6) |
-| `nat` | `iptables -t nat -S` | public REDIRECT ingresses (range → backend port); loopback/private DNAT ignored |
+| `docker` | `docker ps` / `docker inspect` | container id, name, image, status, health, published ports, memory, labels |
+| `firewall` | `LC_ALL=C ufw status verbose` | UFW active/inactive, default policy, ingress ALLOW rules (single port, range, IPv4/v6, scope public/restricted/internal) |
+| `nat` | `iptables -t nat -S` | public REDIRECT ingresses (range → backend port); loopback/private DNAT ignored; destination must match host network identity |
+| `network` | `ip -j addr show` / `ip -j route show` | host's actual addresses, address families, default routes (IPv4/IPv6 exposure judged separately) |
+| `deps` | shared endpoint resolver | `host:port` → service; nginx/nat/docker reuse one resolver; cycle detection + depth bound |
 | `version` | configured argv (never a shell string), with timeout | service version string |
 | `nginx` | `nginx -T` (minimal parser) | listen + proxy_pass → dependency edges |
 
@@ -174,9 +176,35 @@ POST /api/services/{id}/restart — allowlist restart (id only)
 - No WebSocket: the frontend polls (8 s foreground, 45 s hidden) with ETag /
   304. All API responses are `Cache-Control: no-store`.
 - Restart never accepts a unit name, container name, or shell command from the
-  client. The backend resolves the service id against the services.yaml
-  allowlist.
-- No database, no history, no time series, no metrics DB.
+  client. The backend resolves the service id against the state.json-derived
+  allowlist. Restart requires the custom `X-OpsCockpit-Action: restart` header
+  (same-origin hardening, no CORS) and has a per-service cooldown (429).
+
+## Operational hardening
+
+- **Collect is single-flight.** `opscockpit collect` takes an advisory lock
+  (`/run/opscockpit/collect.lock`, stale-owner reclaim) so a timer-triggered
+  collect and a restart-triggered collect never write `state.json.tmp`
+  concurrently.
+- **Serve is non-root by design.** It reads only `state.json` + the embedded
+  frontend. The restart allowlist comes from state.json (units pre-resolved by
+  the root collector), never from the root-owned services.yaml. Serve never
+  parses systemd, Docker, UFW, iptables, or `ip`.
+- **Every external command is bounded.** A context timeout (2–3 s normal, 8 s
+  for nginx/docker) and a 2 MiB output cap prevent a stuck or runaway command
+  from stalling the collector or spiking RAM.
+- **Partial failure is isolated.** A Docker/nginx/firewall/nat failure degrades
+  to unknown and still produces a valid `state.json`; only an unconstructable
+  core schema aborts. The atomic writer preserves the last valid state, which
+  then ages into STALE.
+- **Unix socket preferred in production.** `opscockpit serve -unix
+  /run/opscockpit/opscockpit.sock` (stale socket cleanup, configurable mode);
+  TCP remains for dev/mock.
+- **state.json size guard.** Serve refuses to load a state file above 4 MiB.
+- **No deep health loop.** OpsCockpit only does FAST runtime health (systemd,
+  listeners, docker health, config existence, freshness) during collect. It
+  never runs dozens of network checks every 30 s; deep health is out of scope
+  for the default loop.
 
 ## Single binary
 

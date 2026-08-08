@@ -37,6 +37,7 @@ export async function fetchHealthz(): Promise<Healthz> {
 export async function restartService(serviceId: string): Promise<void> {
   const res = await fetch(`${API_BASE}/api/services/${encodeURIComponent(serviceId)}/restart`, {
     method: 'POST',
+    headers: { 'X-OpsCockpit-Action': 'restart' },
   })
   if (!res.ok) {
     throw new ApiError(res.status, `restart failed: ${res.status}`)

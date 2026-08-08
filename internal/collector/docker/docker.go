@@ -19,6 +19,8 @@ type Container struct {
 	Name           string   `json:"name"`
 	Image          string   `json:"image"`
 	Status         string   `json:"status"`
+	Running        bool     `json:"running"`
+	Health         string   `json:"health,omitempty"` // "" | healthy | unhealthy | starting
 	PublishedPorts []string `json:"published_ports,omitempty"` // "443/tcp" form
 	MemoryBytes    int64    `json:"memory_bytes,omitempty"`
 	Labels         map[string]string `json:"labels,omitempty"`
@@ -74,12 +76,14 @@ func (c ExecClient) List(ctx context.Context) ([]Container, error) {
 			Name:   strings.TrimSpace(parts[1]),
 			Image:  strings.TrimSpace(parts[2]),
 			Status: strings.TrimSpace(parts[3]),
+			Running: strings.HasPrefix(strings.TrimSpace(parts[3]), "Up "),
 		}
-		// Enrich with ports/memory/labels via inspect (best effort).
+		// Enrich with ports/memory/labels/health via inspect (best effort).
 		if insp, ierr := c.inspect(ctx, ctn.ID); ierr == nil {
 			ctn.PublishedPorts = insp.PublishedPorts
 			ctn.MemoryBytes = insp.MemoryBytes
 			ctn.Labels = insp.Labels
+			ctn.Health = insp.Health
 		}
 		containers = append(containers, ctn)
 	}
@@ -89,13 +93,13 @@ func (c ExecClient) List(ctx context.Context) ([]Container, error) {
 func (c ExecClient) inspect(ctx context.Context, id string) (Container, error) {
 	out, err := c.run(ctx, []string{
 		"docker", "inspect", id,
-		"--format", `{{json .HostConfig.PortBindings}}|{{json .HostConfig.Memory}}|{{json .Config.Labels}}`,
+		"--format", `{{json .HostConfig.PortBindings}}|{{json .HostConfig.Memory}}|{{json .Config.Labels}}|{{json .State.Health.Status}}`,
 	})
 	if err != nil {
 		return Container{}, err
 	}
 	res := Container{}
-	parts := strings.SplitN(strings.TrimSpace(out), "|", 3)
+	parts := strings.SplitN(strings.TrimSpace(out), "|", 4)
 	if len(parts) >= 1 {
 		res.PublishedPorts = parsePortBindings(parts[0])
 	}
@@ -106,6 +110,12 @@ func (c ExecClient) inspect(ctx context.Context, id string) (Container, error) {
 	}
 	if len(parts) >= 3 {
 		res.Labels = parseLabels(parts[2])
+	}
+	if len(parts) >= 4 {
+		h := strings.Trim(strings.TrimSpace(parts[3]), `"`)
+		if h != "" && h != "<no value>" {
+			res.Health = h
+		}
 	}
 	return res, nil
 }

@@ -146,3 +146,38 @@ func TestServiceWithoutUnitRejected(t *testing.T) {
 		t.Fatal("expected error for service with no unit")
 	}
 }
+
+func TestRestartCooldown(t *testing.T) {
+	services := []svc.Service{
+		{ID: "nginx", Name: "Nginx", RestartEnabled: true, Systemd: &svc.SystemdConfig{Unit: "nginx.service"}},
+	}
+	mock := NewMock()
+	b := NewBrokerCooldown(EntriesFromServices(services), mock, time.Second)
+	if err := b.Restart(context.Background(), "nginx"); err != nil {
+		t.Fatal(err)
+	}
+	// Immediate second → cooldown.
+	if err := b.Restart(context.Background(), "nginx"); err != ErrCooldown {
+		t.Fatalf("second restart err = %v, want ErrCooldown", err)
+	}
+	if len(mock.Restarts()) != 1 {
+		t.Fatalf("cooldown must prevent a second restart, got %d", len(mock.Restarts()))
+	}
+}
+
+func TestRestartNoCooldownWithoutWindow(t *testing.T) {
+	services := []svc.Service{
+		{ID: "nginx", Name: "Nginx", RestartEnabled: true, Systemd: &svc.SystemdConfig{Unit: "nginx.service"}},
+	}
+	mock := NewMock()
+	b := NewBroker(EntriesFromServices(services), mock) // no cooldown
+	if err := b.Restart(context.Background(), "nginx"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Restart(context.Background(), "nginx"); err != nil {
+		t.Fatalf("second restart with no cooldown: %v", err)
+	}
+	if len(mock.Restarts()) != 2 {
+		t.Fatalf("no cooldown → 2 restarts, got %d", len(mock.Restarts()))
+	}
+}

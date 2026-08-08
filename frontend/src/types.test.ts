@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildPortTree, sortServices, formatBytes, formatDuration, formatPortRange } from '@/types'
+import { buildPortTree, sortServices, formatBytes, formatDuration, formatPortRange, validateState, SchemaError } from '@/types'
 import type { Service, Status, Topology } from '@/types'
 
 function svc(id: string, name: string, status: Status, ram?: number): Service {
@@ -97,5 +97,32 @@ describe('buildPortTree with ranges', () => {
     expect(tree[1].portEnd).toBe(20099)
     // The range service still exposes its backend port.
     expect(tree[1].protocols[0].services[0].serviceId).toBe('hysteria2')
+  })
+})
+
+describe('validateState', () => {
+  const good = {
+    schema_version: 1,
+    generated_at: '2026-08-08T00:00:00Z',
+    collector_version: 'test',
+    collect_duration_ms: 1,
+    host: { hostname: 'h' },
+    services: [],
+    health: { status: 'healthy', stale: false, age_seconds: 1 },
+    topology: { nodes: [], edges: [] },
+  }
+
+  it('accepts a valid state', () => {
+    expect(validateState(good)).toBeTruthy()
+  })
+
+  it('rejects unsupported schema version', () => {
+    expect(() => validateState({ ...good, schema_version: 99 })).toThrow(SchemaError)
+  })
+
+  it('rejects malformed state', () => {
+    expect(() => validateState(null)).toThrow(SchemaError)
+    expect(() => validateState({ schema_version: 1 })).toThrow(SchemaError)
+    expect(() => validateState('garbage')).toThrow(SchemaError)
   })
 })

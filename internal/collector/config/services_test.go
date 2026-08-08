@@ -203,3 +203,22 @@ func TestByID(t *testing.T) {
 		t.Fatal("ByID lookup wrong")
 	}
 }
+
+func TestCanonicalizeConfigPaths(t *testing.T) {
+	s := Service{ConfigPaths: []string{"/etc/nginx/nginx.conf", "relative/path", "/etc/xray/../xray/config.json", "  "}}
+	canon := s.CanonicalizeConfigPaths()
+	// Relative and blank paths are dropped; absolute paths are cleaned.
+	if len(canon) != 2 {
+		t.Fatalf("canonical = %v, want 2 entries", canon)
+	}
+	if canon[0] != "/etc/nginx/nginx.conf" {
+		t.Errorf("canon[0] = %q", canon[0])
+	}
+	if canon[1] != "/etc/xray/config.json" {
+		t.Errorf("canon[1] = %q (should clean ..)", canon[1])
+	}
+	// Reject a relative path entirely.
+	if got := canonicalConfigPath("etc/foo.conf"); got != "" {
+		t.Errorf("relative path must be rejected, got %q", got)
+	}
+}

@@ -166,3 +166,78 @@ func TestUnitPropertiesIncludeControlGroup(t *testing.T) {
 		t.Fatal("unitProperties must include ControlGroup")
 	}
 }
+
+func TestIsTemplateUnit(t *testing.T) {
+	if !IsTemplateUnit("foo@.service") {
+		t.Error("foo@.service is a template")
+	}
+	if IsTemplateUnit("foo@bar.service") {
+		t.Error("foo@bar.service is an instance, not a template")
+	}
+	if IsTemplateUnit("nginx.service") {
+		t.Error("plain unit is not a template")
+	}
+}
+
+func TestOneshotHealthy(t *testing.T) {
+	// active/exited with RemainAfterExit=yes (e.g. apply-rule unit).
+	us := UnitStatus{ActiveState: "active", SubState: "exited", RemainAfterExit: true}
+	if !us.IsHealthyActive() {
+		t.Error("active/exited + RemainAfterExit should be healthy")
+	}
+}
+
+func TestOneshotWithoutRemainAfterExitNotHealthy(t *testing.T) {
+	// active/exited without RemainAfterExit — transient, not a running service.
+	us := UnitStatus{ActiveState: "active", SubState: "exited", RemainAfterExit: false}
+	if us.IsHealthyActive() {
+		t.Error("active/exited without RemainAfterExit must not count as healthy")
+	}
+}
+
+func TestActiveRunningHealthy(t *testing.T) {
+	us := UnitStatus{ActiveState: "active", SubState: "running"}
+	if !us.IsHealthyActive() {
+		t.Error("active/running should be healthy")
+	}
+}
+
+func TestInactiveNotHealthy(t *testing.T) {
+	us := UnitStatus{ActiveState: "inactive", SubState: "dead"}
+	if us.IsHealthyActive() {
+		t.Error("inactive must not be healthy")
+	}
+}
+
+func TestFailedNotHealthy(t *testing.T) {
+	us := UnitStatus{ActiveState: "failed", SubState: "failed"}
+	if us.IsHealthyActive() {
+		t.Error("failed must not be healthy")
+	}
+}
+
+func TestShowUnitOneshotFields(t *testing.T) {
+	mock := &mockRunner{units: map[string]string{
+		"nat-setup.service": `ActiveState=active
+SubState=exited
+MainPID=0
+ControlGroup=/system.slice/nat-setup.service
+Type=oneshot
+RemainAfterExit=yes
+LoadState=loaded
+`,
+	}}
+	us, err := ShowUnit(context.Background(), mock, "nat-setup.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if us.Type != "oneshot" || !us.RemainAfterExit {
+		t.Errorf("oneshot fields = type=%q remain_after_exit=%v", us.Type, us.RemainAfterExit)
+	}
+	if !us.IsHealthyActive() {
+		t.Error("nat-setup (oneshot, RemainAfterExit) should be healthy")
+	}
+	if us.MainPID != 0 {
+		t.Errorf("MainPID = %d, want 0", us.MainPID)
+	}
+}

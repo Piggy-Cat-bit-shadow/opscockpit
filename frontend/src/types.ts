@@ -232,3 +232,37 @@ export function buildPortTree(topology: Topology): TreePort[] {
 export function findServiceNode(topology: Topology, serviceId: string): TopoNode | undefined {
   return topology.nodes.find((n) => n.type === 'service' && n.service_id === serviceId)
 }
+
+// Schema versions the frontend understands.
+export const SCHEMA_VERSION = 1
+
+// SchemaError describes why a state payload could not be used.
+export class SchemaError extends Error {
+  kind: 'schema' | 'malformed'
+  constructor(kind: 'schema' | 'malformed', message: string) {
+    super(message)
+    this.kind = kind
+  }
+}
+
+/**
+ * Validates a parsed state payload before the UI renders it. Returns the state
+ * or throws SchemaError (schema mismatch / malformed). The UI shows a clear but
+ * minimal message instead of white-screening.
+ */
+export function validateState(payload: unknown): State {
+  if (payload == null || typeof payload !== 'object') {
+    throw new SchemaError('malformed', 'State is not an object')
+  }
+  const s = payload as Partial<State>
+  if (s.schema_version == null) {
+    throw new SchemaError('malformed', 'State has no schema_version')
+  }
+  if (s.schema_version !== SCHEMA_VERSION) {
+    throw new SchemaError('schema', `Unsupported schema version ${s.schema_version} (expected ${SCHEMA_VERSION})`)
+  }
+  if (!s.host || !Array.isArray(s.services) || !s.health || !s.topology || !Array.isArray(s.topology.nodes)) {
+    throw new SchemaError('malformed', 'State is missing required sections')
+  }
+  return s as State
+}

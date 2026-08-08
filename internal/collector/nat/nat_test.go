@@ -89,15 +89,56 @@ func TestPrivateDestRedirectIgnored(t *testing.T) {
 }
 
 func TestCollectUnavailable(t *testing.T) {
-	st := Collect(context.Background(), &mockRunner{err: errIPT})
+	st := Collect(context.Background(), &mockRunner{err: errIPT}, nil)
 	if st.Visible {
 		t.Fatal("unavailable nat should be invisible")
 	}
 }
 
 func TestCollectNilRunner(t *testing.T) {
-	if st := Collect(context.Background(), nil); st.Visible {
+	if st := Collect(context.Background(), nil, nil); st.Visible {
 		t.Fatal("nil runner should be invisible")
+	}
+}
+
+// fakeHost owns only 203.0.113.10.
+type fakeHost struct{}
+
+func (fakeHost) OwnsAddress(addr string) bool { return addr == "203.0.113.10" }
+
+func TestCollectFiltersToHost(t *testing.T) {
+	// A REDIRECT to a destination this host does NOT own must not be a public
+	// ingress. 203.0.113.99 is not owned by fakeHost.
+	out := `-P PREROUTING ACCEPT
+-A PREROUTING -d 203.0.113.10/32 -p udp --dport 20000:20099 -j REDIRECT --to-ports 443
+-A PREROUTING -d 203.0.113.99/32 -p udp --dport 9000 -j REDIRECT --to-ports 9001
+-A PREROUTING -d 198.51.100.7/32 -p udp --dport 9100 -j REDIRECT --to-ports 443
+-A PREROUTING -p tcp --dport 9200 -j REDIRECT --to-ports 9201
+`
+	st := Collect(context.Background(), &mockRunner{out: out}, fakeHost{})
+	if !st.Visible {
+		t.Fatal("should be visible")
+	}
+	// The owned-host rule stays public.
+	if !st.PublicRedirects()[0].Public {
+		t.Error("203.0.113.10 (owned) rule should be public")
+	}
+	// Non-owned destinations are demoted to non-public.
+	for _, ing := range st.Ingresses {
+		switch ing.SourcePortStart {
+		case 9000:
+			if ing.Public {
+				t.Error("203.0.113.99 (not owned) must not be public ingress")
+			}
+		case 9100:
+			if ing.Public {
+				t.Error("198.51.100.7 (not owned) must not be public ingress")
+			}
+		case 9200:
+			if !ing.Public {
+				t.Error("no-destination rule should stay public")
+			}
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/opscockpit/opscockpit/internal/collector/cgroup"
@@ -17,14 +18,20 @@ import (
 //   - systemd unit show returns active states
 //   - version commands return version strings
 //   - PID → service id mapping
-//   - UFW and iptables nat fixtures
+//   - UFW, iptables nat, and ip addr/route fixtures
 type mockRunner struct {
-	ssText   string
-	units    map[string]string
-	pidToSvc map[int]string
-	versions map[string]string // argv[0] → version
-	ufwText  string
-	natText  string
+	ssText    string
+	units     map[string]string
+	pidToSvc  map[int]string
+	versions  map[string]string // argv[0] → version
+	ufwText    string
+	natText    string
+	ipAddr     string
+	ipRoute    string
+	nginxText  string
+	dockerPS   string
+	unitExecStart map[string]string // unit → ExecStart override
+	pidCgroups map[int]string // pid → cgroup path (worker mapping)
 }
 
 func (m *mockRunner) Run(ctx context.Context, argv []string) (string, error) {
@@ -33,9 +40,35 @@ func (m *mockRunner) Run(ctx context.Context, argv []string) (string, error) {
 
 func (m *mockRunner) RunUnit(ctx context.Context, unit string, properties []string) (string, error) {
 	if out, ok := m.units[unit]; ok {
+		// Allow a per-unit ExecStart override (for declared-upstream tests).
+		if es, ok := m.unitExecStart[unit]; ok {
+			replaced := replaceExecStart(out, es)
+			if replaced != "" {
+				return replaced, nil
+			}
+		}
 		return out, nil
 	}
 	return "", nil
+}
+
+// replaceExecStart swaps the ExecStart= line in a systemctl show output.
+func replaceExecStart(show, newExecStart string) string {
+	lines := strings.Split(show, "\n")
+	out := make([]string, 0, len(lines))
+	replaced := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "ExecStart=") && !replaced {
+			out = append(out, "ExecStart="+newExecStart)
+			replaced = true
+			continue
+		}
+		out = append(out, line)
+	}
+	if !replaced {
+		return ""
+	}
+	return strings.Join(out, "\n")
 }
 
 func (m *mockRunner) SS(ctx context.Context) (string, error) { return m.ssText, nil }
@@ -52,6 +85,35 @@ func (m *mockRunner) IptablesNat(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	return m.natText, nil
+}
+
+func (m *mockRunner) IPAddrJSON(ctx context.Context) (string, error) {
+	if m.ipAddr == "" {
+		// Default: host has global IPv4 + IPv6 (both families usable).
+		return `[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.10","prefixlen":24,"scope":"global"},{"family":"inet6","local":"2001:db8::10","prefixlen":64,"scope":"global"}]}]`, nil
+	}
+	return m.ipAddr, nil
+}
+
+func (m *mockRunner) IPRouteJSON(ctx context.Context) (string, error) {
+	if m.ipRoute == "" {
+		return `[{"dst":"default","dev":"eth0","family":"inet"},{"dst":"default","dev":"eth0","family":"inet6"}]`, nil
+	}
+	return m.ipRoute, nil
+}
+
+func (m *mockRunner) NginxT(ctx context.Context) (string, error) {
+	if m.nginxText == "" {
+		return "", nil // nginx absent → no deps, never fatal
+	}
+	return m.nginxText, nil
+}
+
+func (m *mockRunner) DockerPS(ctx context.Context) (string, error) {
+	if m.dockerPS == "" {
+		return "", nil // docker absent → no containers, never fatal
+	}
+	return m.dockerPS, nil
 }
 
 func (m *mockRunner) Version(ctx context.Context, argv []string) (string, error) {

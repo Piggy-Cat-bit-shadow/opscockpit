@@ -103,3 +103,38 @@ func TestSplitCommaNotInBrackets(t *testing.T) {
 		t.Fatalf("parts = %v", parts)
 	}
 }
+
+func TestContainerHealthAndRunning(t *testing.T) {
+	ps := "abc123|adguard|adguard/adguardhome:latest|Up 3 days\n" +
+		"def456|xray|xray:v1|Exited (0) 2 days ago\n" +
+		"abc124|unhealthy|img|Up 1 hour (unhealthy)\n"
+	insp := map[string]string{
+		"abc123": `{}|0|{}|"healthy"`,
+		"def456": `{}|0|{}|"unhealthy"`,
+		"abc124": `{}|0|{}|"unhealthy"`,
+	}
+	client := mockClient(ps, insp)
+	containers, err := client.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) != 3 {
+		t.Fatalf("got %d containers", len(containers))
+	}
+	ad := containers[0]
+	if !ad.Running {
+		t.Error("Up container should be running")
+	}
+	if ad.Health != "healthy" {
+		t.Errorf("adguard health = %q", ad.Health)
+	}
+	if containers[1].Running {
+		t.Error("Exited container should not be running")
+	}
+	if containers[2].Health != "unhealthy" {
+		t.Errorf("unhealthy container health = %q", containers[2].Health)
+	}
+	if !containers[2].Running {
+		t.Error("Up (unhealthy) container should still be running")
+	}
+}

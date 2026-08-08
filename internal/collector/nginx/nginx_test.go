@@ -38,6 +38,42 @@ stream {
 }
 `
 
+const nginxUpstreamFixture = `# configuration file /etc/nginx/nginx.conf:
+http {
+  upstream web_backend {
+    server 127.0.0.1:9443;
+  }
+  server {
+    listen 443;
+    proxy_pass web_backend;
+  }
+}
+`
+
+const nginxMapFixture = `# configuration file /etc/nginx/nginx.conf:
+stream {
+  map $ssl_preread_server_name $backend {
+    api.example.com anytls_backend;
+    sub.example.com sub_backend;
+    default web_backend;
+  }
+  upstream anytls_backend {
+    server 127.0.0.1:9443;
+  }
+  upstream sub_backend {
+    server 127.0.0.1:18444;
+  }
+  upstream web_backend {
+    server 127.0.0.1:853;
+  }
+  server {
+    listen 443;
+    ssl_preread on;
+    proxy_pass $backend;
+  }
+}
+`
+
 func TestParseNginxFixture(t *testing.T) {
 	cfg := Parse(nginxFixture)
 
@@ -112,5 +148,56 @@ func TestParseTarget(t *testing.T) {
 		if ok != c.ok || host != c.host || port != c.port {
 			t.Errorf("parseTarget(%q) = %q,%d,%v want %q,%d,%v", c.in, host, port, ok, c.host, c.port, c.ok)
 		}
+	}
+}
+
+func TestNamedUpstream(t *testing.T) {
+	cfg := Parse(nginxUpstreamFixture)
+	if len(cfg.Upstreams) != 1 || cfg.Upstreams[0].Name != "web_backend" {
+		t.Fatalf("upstreams = %+v", cfg.Upstreams)
+	}
+	if len(cfg.Upstreams[0].Servers) != 1 || cfg.Upstreams[0].Servers[0] != "127.0.0.1:9443" {
+		t.Fatalf("upstream servers = %+v", cfg.Upstreams[0].Servers)
+	}
+	// The proxy_pass to the named upstream resolves to the upstream server.
+	ep := cfg.ResolveProxyTargets()
+	found := false
+	for _, endpoints := range ep {
+		for _, e := range endpoints {
+			if e == "127.0.0.1:9443" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("named upstream endpoint 127.0.0.1:9443 not resolved: %+v", ep)
+	}
+}
+
+func TestMapVariableResolvesToUpstreams(t *testing.T) {
+	cfg := Parse(nginxMapFixture)
+	if len(cfg.Upstreams) != 3 {
+		t.Fatalf("upstreams = %d, want 3", len(cfg.Upstreams))
+	}
+	if len(cfg.Maps["$backend"]) == 0 {
+		t.Fatalf("map $backend entries missing: %+v", cfg.Maps)
+	}
+	// $backend should resolve to anytls_backend/sub_backend/web_backend servers:
+	// 127.0.0.1:9443, 127.0.0.1:18444, 127.0.0.1:853.
+	ep := cfg.ResolveProxyTargets()
+	all := map[string]bool{}
+	for _, endpoints := range ep {
+		for _, e := range endpoints {
+			all[e] = true
+		}
+	}
+	for _, want := range []string{"127.0.0.1:9443", "127.0.0.1:18444", "127.0.0.1:853"} {
+		if !all[want] {
+			t.Errorf("map-resolved endpoint %q missing: %+v", want, all)
+		}
+	}
+	// The literal $backend variable must never be treated as an endpoint.
+	if all["$backend"] {
+		t.Error("$backend must not be resolved as a literal endpoint")
 	}
 }

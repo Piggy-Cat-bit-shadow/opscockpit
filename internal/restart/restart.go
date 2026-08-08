@@ -18,6 +18,7 @@ import (
 	"time"
 
 	svc "github.com/opscockpit/opscockpit/internal/collector/config"
+	"github.com/opscockpit/opscockpit/internal/state"
 )
 
 // ServiceIDPattern bounds what a service id may look like. The API validates
@@ -33,6 +34,10 @@ var ErrRestartDisabled = errors.New("restart disabled for service")
 
 // ErrInvalidID is returned when the id fails the pattern check.
 var ErrInvalidID = errors.New("invalid service id")
+
+// ErrCooldown is returned when a restart is attempted within the cooldown
+// window for the same service.
+var ErrCooldown = errors.New("restart requested too soon; cooldown active")
 
 // Backend actually performs a restart. The real implementation (future phase)
 // would run `systemctl restart <unit>` where <unit> comes from the allowlist
@@ -101,6 +106,12 @@ type Broker struct {
 	units map[string]unitEntry
 	// backend performs the restart.
 	backend Backend
+	// cooldown bounds how often the same service may be restarted.
+	cooldown time.Duration
+	// lastRestart tracks the last restart time per service id.
+	lastRestart map[string]time.Time
+	// mu guards lastRestart (restart can be triggered concurrently).
+	mu sync.Mutex
 }
 
 type unitEntry struct {
@@ -110,7 +121,17 @@ type unitEntry struct {
 
 // NewBroker builds a broker from the services registry.
 func NewBroker(entries []Entry, backend Backend) *Broker {
-	b := &Broker{units: map[string]unitEntry{}, backend: backend}
+	return NewBrokerCooldown(entries, backend, 0)
+}
+
+// NewBrokerCooldown builds a broker with a per-service restart cooldown.
+func NewBrokerCooldown(entries []Entry, backend Backend, cooldown time.Duration) *Broker {
+	b := &Broker{
+		units:       map[string]unitEntry{},
+		backend:     backend,
+		cooldown:    cooldown,
+		lastRestart: map[string]time.Time{},
+	}
 	for _, e := range entries {
 		b.units[e.ID] = unitEntry{unit: e.Unit, restartEnabled: e.RestartEnabled}
 	}
@@ -133,6 +154,18 @@ func EntriesFromServices(services []svc.Service) []Entry {
 	return out
 }
 
+// EntriesFromStateServices converts state.json service entries into allowlist
+// entries. This is what `serve` uses — it reads only state.json (which carries
+// restart_enabled + unit), never the root-owned services.yaml. The unit is the
+// state's (pre-resolved) unit, so serve never parses systemd or Docker.
+func EntriesFromStateServices(services []state.Service) []Entry {
+	out := make([]Entry, 0, len(services))
+	for _, s := range services {
+		out = append(out, Entry{ID: s.ID, Unit: s.Unit, RestartEnabled: s.RestartEnabled})
+	}
+	return out
+}
+
 // Restart resolves id and restarts the allowlisted unit. The unit string used
 // is the allowlist's, never client-supplied.
 func (b *Broker) Restart(ctx context.Context, id string) error {
@@ -148,6 +181,17 @@ func (b *Broker) Restart(ctx context.Context, id string) error {
 	}
 	if entry.unit == "" {
 		return fmt.Errorf("service %q has no unit configured", id)
+	}
+	// In-memory cooldown: same service cannot be restarted twice within the
+	// window (double-click / duplicate submit / rapid repeat).
+	if b.cooldown > 0 {
+		b.mu.Lock()
+		if last, ok := b.lastRestart[id]; ok && time.Since(last) < b.cooldown {
+			b.mu.Unlock()
+			return ErrCooldown
+		}
+		b.lastRestart[id] = time.Now()
+		b.mu.Unlock()
 	}
 	return b.backend.Restart(ctx, entry.unit)
 }

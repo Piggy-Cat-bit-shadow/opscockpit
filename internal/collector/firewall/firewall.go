@@ -46,6 +46,20 @@ const (
 	DirectionOut Direction = "out"
 )
 
+// Scope classifies how public a rule's source is.
+type Scope string
+
+const (
+	// ScopePublic means the rule allows from Anywhere (any internet source).
+	ScopePublic Scope = "public"
+	// ScopeRestricted means the rule allows from a specific public CIDR/address.
+	ScopeRestricted Scope = "restricted"
+	// ScopeInternal means the rule allows only from private/loopback sources.
+	ScopeInternal Scope = "internal"
+	// ScopeUnknown means the source could not be classified.
+	ScopeUnknown Scope = "unknown"
+)
+
 // Rule is one normalized firewall rule relevant to ingress exposure.
 type Rule struct {
 	Protocol   string    `json:"protocol"`              // tcp | udp ("" = any)
@@ -58,6 +72,7 @@ type Rule struct {
 	Comment    string    `json:"comment,omitempty"`     // informational only, never used in decisions
 	From       string    `json:"from,omitempty"`        // source address or "any"
 	To         string    `json:"to,omitempty"`
+	Scope      Scope     `json:"scope,omitempty"`       // exposure scope of the source
 }
 
 // Status is the normalized firewall snapshot.
@@ -76,7 +91,15 @@ func (s Status) DefaultDenyIn() bool {
 // AllowedIn reports whether a (protocol, port) pair is explicitly allowed for
 // inbound traffic. An explicit allow always wins over the default policy.
 func (s Status) AllowedIn(protocol string, port int) bool {
-	for _, r := range s.Rules {
+	return s.AllowedInScoped(protocol, port, ScopeUnknown) != nil
+}
+
+// AllowedInScoped returns the matching allow rule for (protocol, port) whose
+// scope is at least as public as minScope, or nil. A restricted rule
+// (e.g. from a private CIDR) is not public exposure.
+func (s Status) AllowedInScoped(protocol string, port int, minScope Scope) *Rule {
+	for i := range s.Rules {
+		r := &s.Rules[i]
 		if r.Direction != DirectionIn {
 			continue
 		}
@@ -86,11 +109,121 @@ func (s Status) AllowedIn(protocol string, port int) bool {
 		if !protocolMatches(r.Protocol, protocol) {
 			continue
 		}
-		if portInRange(r.PortStart, r.PortEnd, port) {
+		if !portInRange(r.PortStart, r.PortEnd, port) {
+			continue
+		}
+		// Scope precedence: public > restricted > unknown > internal.
+		if scopeRank(r.Scope) < scopeRank(minScope) {
+			continue
+		}
+		return r
+	}
+	return nil
+}
+
+// IsPubliclyAllowed reports whether (protocol, port) is allowed from a truly
+// public source (Anywhere or a public CIDR), not just a private/restricted one.
+func (s Status) IsPubliclyAllowed(protocol string, port int) bool {
+	r := s.AllowedInScoped(protocol, port, ScopeRestricted)
+	return r != nil && scopeRank(r.Scope) >= scopeRank(ScopeRestricted)
+}
+
+func scopeRank(sc Scope) int {
+	switch sc {
+	case ScopePublic:
+		return 3
+	case ScopeRestricted:
+		return 2
+	case ScopeUnknown:
+		return 1
+	default:
+		return 0 // internal
+	}
+}
+
+// classifyFromScope maps a UFW From source to an exposure scope.
+//   - Anywhere / "any" → public
+//   - Anywhere (v6) → public
+//   - specific public CIDR/address → restricted
+//   - RFC1918 / loopback → internal
+//   - unparseable → unknown
+func classifyFromScope(from string, ipVersion int) Scope {
+	f := strings.TrimSpace(from)
+	lower := strings.ToLower(f)
+	switch {
+	case lower == "anywhere" || lower == "any" || strings.HasPrefix(lower, "anywhere"):
+		return ScopePublic
+	case f == "":
+		return ScopeUnknown
+	}
+	// Strip an interface qualifier like "Anywhere on eth0".
+	if i := strings.Index(f, " on "); i >= 0 {
+		f = strings.TrimSpace(f[:i])
+	}
+	if strings.Contains(lower, "(") {
+		// "(v6)" marker already handled by IPVersion; strip it.
+		if i := strings.Index(f, "("); i >= 0 {
+			f = strings.TrimSpace(f[:i])
+		}
+	}
+	if f == "" || strings.EqualFold(f, "anywhere") {
+		return ScopePublic
+	}
+	// CIDR or single address.
+	host, _, hasSlash := splitCIDR(f)
+	if !hasSlash && !looksLikeIP(host) {
+		return ScopeUnknown
+	}
+	if isPrivateAddr(host) || isLoopbackAddr(host) {
+		return ScopeInternal
+	}
+	return ScopeRestricted
+}
+
+func splitCIDR(s string) (host, mask string, ok bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			return s[:i], s[i+1:], true
+		}
+	}
+	return s, "", false
+}
+
+func looksLikeIP(s string) bool {
+	return strings.Contains(s, ".") || strings.Contains(s, ":")
+}
+
+func isPrivateAddr(host string) bool {
+	first, second := 0, 0
+	parts := strings.Split(host, ".")
+	if len(parts) == 4 {
+		fmt.Sscanf(parts[0], "%d", &first)
+		fmt.Sscanf(parts[1], "%d", &second)
+	}
+	switch {
+	case first == 10:
+		return true
+	case first == 172 && second >= 16 && second <= 31:
+		return true
+	case first == 192 && second == 168:
+		return true
+	case first == 100 && second >= 64 && second <= 127:
+		return true
+	case first == 169 && second == 254:
+		return true
+	case first == 198 && second >= 18 && second <= 19:
+		return true
+	}
+	if strings.Contains(host, ":") {
+		if strings.HasPrefix(host, "fc") || strings.HasPrefix(host, "fd") || strings.HasPrefix(host, "fe8") {
 			return true
 		}
 	}
 	return false
+}
+
+func isLoopbackAddr(host string) bool {
+	return host == "127.0.0.1" || host == "::1" || strings.HasPrefix(host, "127.")
 }
 
 func protocolMatches(ruleProto, want string) bool {
@@ -266,6 +399,9 @@ func parseRuleLine(line string) (Rule, bool) {
 	if strings.Contains(line, "(v6)") {
 		r.IPVersion = 6
 	}
+
+	// Scope from the From source (set early; overridden if from changes).
+	r.Scope = classifyFromScope(from, r.IPVersion)
 
 	// Parse the To spec: port/proto, range/proto, or bare interface/address.
 	toSpec := toPart

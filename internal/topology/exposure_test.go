@@ -215,3 +215,32 @@ func TestPortLabel(t *testing.T) {
 		t.Errorf("PortLabel(20000,20099) = %q", got)
 	}
 }
+
+func TestExplosionGuard(t *testing.T) {
+	// 3000 public listeners would normally produce thousands of nodes; the
+	// guard must cap the total (allowance for one loop iteration appending a
+	// port+protocol+service+edges before the cap re-checks).
+	services := []svc.Service{{ID: "s", Name: "S", StatusHint: state.StatusHealthy}}
+	listeners := make([]Listener, 0, 3000)
+	for i := 0; i < 3000; i++ {
+		listeners = append(listeners, Listener{
+			ServiceID: "s", Protocol: "tcp", Port: 10000 + i,
+			Address: "0.0.0.0", Exposure: state.ExposureDirectPublic,
+		})
+	}
+	tp, err := Generate(Input{Services: services, Listeners: listeners}, Options{IncludeInternetRoot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tp.Nodes) > defaultMaxNodes+8 {
+		t.Fatalf("nodes = %d, exceeds explosion guard %d", len(tp.Nodes), defaultMaxNodes+8)
+	}
+	if len(tp.Edges) > defaultMaxEdges+8 {
+		t.Fatalf("edges = %d, exceeds explosion guard %d", len(tp.Edges), defaultMaxEdges+8)
+	}
+	// Deterministic even when capped.
+	tp2, _ := Generate(Input{Services: services, Listeners: listeners}, Options{IncludeInternetRoot: true})
+	if !reflect.DeepEqual(tp, tp2) {
+		t.Fatal("capped topology must be deterministic")
+	}
+}

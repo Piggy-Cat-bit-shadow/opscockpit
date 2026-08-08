@@ -70,15 +70,45 @@ func (r ExecRunner) RunUnit(ctx context.Context, unit string, properties []strin
 
 // UnitStatus is the parsed result of a systemctl show query.
 type UnitStatus struct {
-	ActiveState   string
-	SubState      string
-	MainPID       int
-	ControlGroup  string
-	FragmentPath  string
-	ExecStart     string
-	Result        string
-	LoadState     string
-	Found         bool
+	ActiveState     string
+	SubState        string
+	MainPID         int
+	ControlGroup    string
+	FragmentPath    string
+	ExecStart       string
+	Result          string
+	LoadState       string
+	Type            string
+	RemainAfterExit bool
+	Found           bool
+}
+
+// IsHealthyActive reports whether the unit is in an active state that counts as
+// healthy for a running service.
+//   - active/running → healthy
+//   - active/exited with RemainAfterExit (oneshot apply-rule units) → healthy
+//   - anything else (inactive, failed, active/exited without RemainAfterExit)
+//     → not healthy
+func (us UnitStatus) IsHealthyActive() bool {
+	if us.ActiveState != "active" {
+		return false
+	}
+	if us.SubState == "running" {
+		return true
+	}
+	return us.SubState == "exited" && us.RemainAfterExit
+}
+
+// IsTemplateUnit reports whether unit is an uninstantiated systemd template
+// (e.g. "foo@.service"). Template definitions are not runtime services; only
+// concrete instances (foo@bar.service) are.
+func IsTemplateUnit(unit string) bool {
+	for i := 0; i+1 < len(unit); i++ {
+		if unit[i] == '@' && unit[i+1] == '.' {
+			return true
+		}
+	}
+	return false
 }
 
 // property names we query.
@@ -91,6 +121,8 @@ var unitProperties = []string{
 	"ExecStart",
 	"Result",
 	"LoadState",
+	"Type",
+	"RemainAfterExit",
 }
 
 // ShowUnit queries and parses one unit. Returns Found=false when the unit does
@@ -114,6 +146,8 @@ func ShowUnit(ctx context.Context, r Runner, unit string) (UnitStatus, error) {
 	us.Result = kv["Result"]
 	us.LoadState = kv["LoadState"]
 	us.ControlGroup = kv["ControlGroup"]
+	us.Type = kv["Type"]
+	us.RemainAfterExit = strings.EqualFold(kv["RemainAfterExit"], "yes")
 	if v, ok := kv["MainPID"]; ok {
 		us.MainPID = atoi(v)
 	}

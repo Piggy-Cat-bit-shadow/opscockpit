@@ -14,8 +14,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -34,13 +36,25 @@ type StateStore interface {
 // FileStore loads state.json from a path, hashing the raw bytes for ETags.
 type FileStore struct {
 	Path string
+	// MaxBytes bounds the state file size so a runaway collector cannot make
+	// serve load tens/hundreds of MB into memory. Default 4 MiB.
+	MaxBytes int64
 }
 
 // LoadState implements StateStore.
 func (f FileStore) LoadState() (*state.State, string, error) {
+	if f.MaxBytes <= 0 {
+		f.MaxBytes = 4 << 20
+	}
+	if fi, err := os.Stat(f.Path); err == nil && fi.Size() > f.MaxBytes {
+		return nil, "", fmt.Errorf("state.json exceeds size limit (%d bytes)", fi.Size())
+	}
 	raw, err := readFile(f.Path)
 	if err != nil {
 		return nil, "", err
+	}
+	if int64(len(raw)) > f.MaxBytes {
+		return nil, "", fmt.Errorf("state.json exceeds size limit (%d bytes)", len(raw))
 	}
 	var st state.State
 	if err := json.Unmarshal(raw, &st); err != nil {
@@ -124,6 +138,13 @@ func (s *Server) HandleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleRestart serves POST /api/services/{id}/restart.
+//
+// Same-origin hardening (no user system, no CORS):
+//   - POST only
+//   - requires the custom X-OpsCockpit-Action: restart header (browser forms
+//     and cross-site fetches cannot set custom headers without CORS)
+//   - Origin/Host must match, when present
+//   - empty body only
 func (s *Server) HandleRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -131,6 +152,21 @@ func (s *Server) HandleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	noStore(w)
+
+	// Same-origin: custom header is required (cannot be set cross-origin).
+	if r.Header.Get("X-OpsCockpit-Action") != "restart" {
+		http.Error(w, "missing or invalid X-OpsCockpit-Action header", http.StatusForbidden)
+		return
+	}
+	// Origin/Host consistency: reject a cross-site Origin that doesn't match
+	// the request Host (simple CSRF guard; no wildcard CORS anywhere).
+	if origin := r.Header.Get("Origin"); origin != "" {
+		host := r.Host
+		if !strings.Contains(origin, "//"+host) && !strings.Contains(origin, host) {
+			http.Error(w, "cross-origin request rejected", http.StatusForbidden)
+			return
+		}
+	}
 
 	id := strings.TrimPrefix(r.URL.Path, "/api/services/")
 	id = strings.TrimSuffix(id, "/restart")
@@ -158,6 +194,9 @@ func (s *Server) HandleRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown service", http.StatusNotFound)
 	case errors.Is(err, restart.ErrRestartDisabled):
 		http.Error(w, "restart disabled for service", http.StatusForbidden)
+	case errors.Is(err, restart.ErrCooldown):
+		w.Header().Set("Retry-After", "10")
+		http.Error(w, "restart cooldown active", http.StatusTooManyRequests)
 	case err != nil:
 		http.Error(w, "restart failed", http.StatusInternalServerError)
 	default:

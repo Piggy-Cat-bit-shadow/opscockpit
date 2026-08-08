@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { State } from '@/types'
+import { validateState, SchemaError } from '@/types'
 import { createPollController, restartService } from '@/api'
 import { HostSummary } from '@/components/HostSummary'
 import { TopologyView } from '@/components/TopologyView'
@@ -10,7 +11,7 @@ import { COLORS } from '@/theme'
 
 export default function App() {
   const [state, setState] = useState<State | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<{ title: string; detail: string } | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
 
@@ -19,11 +20,23 @@ export default function App() {
     setError(null)
   }, [])
   const onError = useCallback((e: unknown) => {
-    setError(e instanceof Error ? e.message : 'load failed')
+    // Schema/malformed errors are shown clearly; network errors say the API
+    // is unreachable. Never white-screen.
+    if (e instanceof SchemaError) {
+      setError({ title: e.kind === 'schema' ? 'Schema mismatch' : 'State unavailable', detail: e.message })
+    } else {
+      setError({ title: 'State unavailable', detail: e instanceof Error ? e.message : 'API unreachable' })
+    }
   }, [])
 
   useEffect(() => {
-    const controller = createPollController(onData, onError)
+    const controller = createPollController((payload) => {
+      try {
+        onData(validateState(payload))
+      } catch (e) {
+        onError(e)
+      }
+    }, onError)
     const stop = controller.subscribe()
     return stop
   }, [onData, onError])
@@ -48,8 +61,15 @@ export default function App() {
       {!state && !error && <div className="oc-loading">Loading…</div>}
       {!state && error && (
         <div className="oc-loading oc-error">
-          Cannot reach the server: {error}
+          <strong>{error.title}</strong>
+          <span>{error.detail}</span>
           <div className="oc-dim">Run <code>opscockpit collect</code> then <code>opscockpit serve</code>.</div>
+        </div>
+      )}
+
+      {state && (
+        <div className="oc-state-banner">
+          {state.health.stale && <div className="oc-stale-banner">STALE — state is older than expected, values may be outdated.</div>}
         </div>
       )}
 

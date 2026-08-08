@@ -53,11 +53,14 @@ OPSCOCKPIT_SS_FILE="$WORK/ss.txt" \
 OPSCOCKPIT_UNIT_DIR="$ROOT/testdata/systemd" \
 OPSCOCKPIT_UFW_FILE="$ROOT/testdata/ufw-status.txt" \
 OPSCOCKPIT_NAT_FILE="$ROOT/testdata/iptables-nat.txt" \
+OPSCOCKPIT_IPADDR_FILE="$ROOT/testdata/ip-addr.json" \
+OPSCOCKPIT_IPROUTE_FILE="$ROOT/testdata/ip-route.json" \
   "$BUILD_DIR/opscockpit" collect \
   -services "$ROOT/configs/services.example.yaml" \
   -out "$WORK/state.json" \
   -root "$ROOT/testdata" \
-  -cpu-interval-ms 0
+  -cpu-interval-ms 0 \
+  -lock "$WORK/collect.lock"
 
 echo "==> topology ports in state.json:"
 grep -oE '"(443|853|8443|9443|18444)"' "$WORK/state.json" | sort | uniq -c

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,10 +35,39 @@ type Service struct {
 	RestartEnabled bool           `yaml:"restart_enabled"`
 	Health         *HealthConfig  `yaml:"health,omitempty"`
 	Exposure       *ExposureConfig `yaml:"exposure,omitempty"`
+	Topology       *TopologyConfig `yaml:"topology,omitempty"`
+	Docker         *DockerConfig   `yaml:"docker,omitempty"`
 
 	// StatusHint is populated by the collector at runtime (not from YAML).
 	// It feeds topology node status dots. Not part of the config file.
 	StatusHint string `yaml:"-"`
+}
+
+// DockerConfig ties a service to a Docker container as its runtime source.
+// A service may come from systemd OR Docker — a Docker-backed service does not
+// need to masquerade as a systemd unit.
+type DockerConfig struct {
+	// Container is the container name (or id prefix) this service maps to.
+	Container string `yaml:"container"`
+}
+
+// TopologyConfig declares explicit topology hints. It is never a topology
+// database — it only declares safe, deterministic relations the runtime
+// collectors cannot infer (e.g. a ShadowTLS chain endpoint read from a command
+// flag).
+type TopologyConfig struct {
+	// UpstreamFrom lists command-flag endpoints that declare a downstream
+	// relation, e.g. a proxy binary started with --server 127.0.0.1:17414.
+	// Only the specific flag's value is read; the full ExecStart is never kept.
+	UpstreamFrom []UpstreamFrom `yaml:"upstream_from,omitempty"`
+}
+
+// UpstreamFrom is one declared upstream source.
+type UpstreamFrom struct {
+	// Source is the evidence kind: "exec_arg".
+	Source string `yaml:"source"`
+	// Flag is the exact command flag whose value is an endpoint, e.g. --server.
+	Flag string `yaml:"flag"`
 }
 
 // ExposureConfig overrides runtime exposure classification for a service.
@@ -78,6 +108,11 @@ type HealthConfig struct {
 	// set for the service to be considered healthy. An active unit with a
 	// missing required listener is a failed service.
 	RequiredListeners []ListenerRequirement `yaml:"required_listeners,omitempty"`
+	// RequireListener controls whether "registered service" implies "must have
+	// a listener". auto (default): inferred from unit type (oneshot → false,
+	// network daemon → true). true: a missing listener is a fault. false:
+	// listener absence is never a fault (static/maintenance services).
+	RequireListener string `yaml:"require_listener,omitempty"`
 }
 
 // ListenerRequirement names a listener the service must be bound to.
@@ -193,6 +228,11 @@ func (c *Config) Validate() error {
 					return fmt.Errorf("services[%d] %q: health.required_listeners protocol %q must be tcp or udp", i, s.ID, r.Protocol)
 				}
 			}
+			switch s.Health.RequireListener {
+			case "", "auto", "true", "false":
+			default:
+				return fmt.Errorf("services[%d] %q: health.require_listener %q invalid (auto|true|false)", i, s.ID, s.Health.RequireListener)
+			}
 		}
 		if s.Exposure != nil {
 			switch s.Exposure.Mode {
@@ -271,6 +311,56 @@ func (s *Service) FirstConfigPath() string {
 	return s.ConfigPaths[0]
 }
 
+// CanonicalizeConfigPaths cleans each config path (requires absolute, resolves
+// symlinks when possible, never descends into parent directories). Returns the
+// canonicalized slice.
+func (s *Service) CanonicalizeConfigPaths() []string {
+	out := make([]string, 0, len(s.ConfigPaths))
+	for _, p := range s.ConfigPaths {
+		c := canonicalConfigPath(p)
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// canonicalConfigPath validates and cleans a single config path. Only absolute
+// paths are accepted; relative paths are dropped (never guessed).
+func canonicalConfigPath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" || !filepath.IsAbs(p) {
+		return ""
+	}
+	// Clean the path (resolve . / .. without touching the filesystem).
+	cleaned := filepath.Clean(p)
+	if cleaned != p {
+		p = cleaned
+	}
+	return p
+}
+
+// ResolveConfigPath canonicalizes and resolves symlinks when the file exists.
+// Errors are ignored (the config may legitimately not exist yet).
+func ResolveConfigPath(p string) string {
+	c := canonicalConfigPath(p)
+	if c == "" {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(c); err == nil {
+		return r
+	}
+	return c
+}
+
+// DockerContainer returns the configured container name, or "".
+func (s *Service) DockerContainer() string {
+	if s.Docker == nil {
+		return ""
+	}
+	return s.Docker.Container
+}
+
 // ExposureMode returns the configured exposure mode ("auto" when unset).
 func (s *Service) ExposureMode() string {
 	if s.Exposure == nil || s.Exposure.Mode == "" {
@@ -286,6 +376,15 @@ func (s *Service) ForceDirectPublic() bool {
 		return false
 	}
 	return s.Exposure.ForceDirectPublic || s.Exposure.ExposeDirect
+}
+
+// RequireListener reports whether this service's health requires a listener.
+// auto (default) defers to unit semantics: oneshot units do not require one.
+func (s *Service) RequireListener() string {
+	if s.Health == nil || s.Health.RequireListener == "" {
+		return "auto"
+	}
+	return s.Health.RequireListener
 }
 
 // DefaultConfig returns the default services.yaml content used as an example.

@@ -402,3 +402,53 @@ func TestExposureFirewallUnknown(t *testing.T) {
 		t.Error("nginx must not be direct_public when firewall is unknown")
 	}
 }
+
+// IPv4-only host: an IPv6 wildcard bind + IPv6 UFW allow must NOT create a
+// public IPv6 service.
+func TestExposureIPv6RequiresGlobalV6(t *testing.T) {
+	r := exposureRunner(exposureUFW, exposureNAT, exposureSS)
+	// Host has ONLY IPv4 (no global IPv6, no default v6 route).
+	r.ipAddr = `[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.10","prefixlen":24,"scope":"global"}]}]`
+	r.ipRoute = `[{"dst":"default","dev":"eth0","family":"inet"}]`
+	st := exposureCollect(t, r)
+
+	// hysteria2 listens on [::]:443 with a UFW v6+any allow, but the host has
+	// no global IPv6 → must NOT be direct_public via the v6 bind.
+	hy := byID(t, st, "hysteria2")
+	if hy.Listeners[0].Exposure == state.ExposureDirectPublic {
+		t.Error("hysteria on [::]:443 must not be direct_public when host has no global IPv6")
+	}
+}
+
+// IPv4-only host: an IPv4 wildcard bind with UFW allow IS direct_public.
+func TestExposureIPv4WorksWithoutV6(t *testing.T) {
+	r := exposureRunner(exposureUFW, exposureNAT, exposureSS)
+	r.ipAddr = `[{"ifname":"eth0","addr_info":[{"family":"inet","local":"203.0.113.10","prefixlen":24,"scope":"global"}]}]`
+	r.ipRoute = `[{"dst":"default","dev":"eth0","family":"inet"}]`
+	st := exposureCollect(t, r)
+
+	ng := byID(t, st, "nginx")
+	if ng.Listeners[0].Exposure != state.ExposureDirectPublic {
+		t.Errorf("nginx on 0.0.0.0:443 should be direct_public on an IPv4 host, got %q", ng.Listeners[0].Exposure)
+	}
+}
+
+// Restricted firewall source (RFC1918 only) must not be public exposure.
+func TestExposureRestrictedSourceNotPublic(t *testing.T) {
+	r := exposureRunner(`Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+443/tcp                    ALLOW IN    10.0.0.0/8
+`, exposureNAT, exposureSS)
+	st := exposureCollect(t, r)
+
+	ng := byID(t, st, "nginx")
+	if ng.Listeners[0].Exposure == state.ExposureDirectPublic {
+		t.Error("nginx 443/tcp from 10.0.0.0/8 must NOT be direct_public")
+	}
+	if ng.Listeners[0].Exposure != state.ExposureInternal {
+		t.Errorf("nginx exposure = %q, want internal (restricted source)", ng.Listeners[0].Exposure)
+	}
+}

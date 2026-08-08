@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -71,10 +72,10 @@ func newTestServer(t *testing.T, st *state.State) *Server {
 	raw, _ := json.Marshal(st)
 	store := &memStore{st: st, raw: raw}
 
-	broker := restart.NewBroker([]restart.Entry{
+	broker := restart.NewBrokerCooldown([]restart.Entry{
 		{ID: "hysteria2", Unit: "hysteria-server.service", RestartEnabled: true},
 		{ID: "xray", Unit: "xray.service", RestartEnabled: false},
-	}, restart.NewMock())
+	}, restart.NewMock(), 10*time.Second)
 
 	return New(store, broker, http.NotFoundHandler(), false, nil)
 }
@@ -165,6 +166,9 @@ func TestHandleHealthzStale(t *testing.T) {
 func TestHandleRestartKnown(t *testing.T) {
 	s := newTestServer(t, testState(true))
 	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
+	req.Header.Set("X-OpsCockpit-Action", "restart")
+	req.Host = "localhost:8090"
+	req.Header.Set("Origin", "http://localhost:8090")
 	rr := httptest.NewRecorder()
 	s.HandleRestart(rr, req)
 	if rr.Code != http.StatusAccepted {
@@ -178,6 +182,7 @@ func TestHandleRestartKnown(t *testing.T) {
 func TestHandleRestartUnknown(t *testing.T) {
 	s := newTestServer(t, testState(true))
 	req := httptest.NewRequest("POST", "/api/services/ghost/restart", nil)
+	req.Header.Set("X-OpsCockpit-Action", "restart")
 	rr := httptest.NewRecorder()
 	s.HandleRestart(rr, req)
 	if rr.Code != http.StatusNotFound {
@@ -185,9 +190,60 @@ func TestHandleRestartUnknown(t *testing.T) {
 	}
 }
 
+func TestHandleRestartMissingHeader(t *testing.T) {
+	s := newTestServer(t, testState(true))
+	// No X-OpsCockpit-Action header → CSRF guard rejects.
+	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
+	rr := httptest.NewRecorder()
+	s.HandleRestart(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403 (missing action header)", rr.Code)
+	}
+}
+
+func TestHandleRestartCrossOriginRejected(t *testing.T) {
+	s := newTestServer(t, testState(true))
+	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
+	req.Header.Set("X-OpsCockpit-Action", "restart")
+	req.Host = "localhost:8090"
+	req.Header.Set("Origin", "http://evil.example")
+	rr := httptest.NewRecorder()
+	s.HandleRestart(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403 (cross-origin)", rr.Code)
+	}
+}
+
+func TestHandleRestartCooldown(t *testing.T) {
+	s := newTestServer(t, testState(true))
+	// First restart succeeds.
+	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
+	req.Header.Set("X-OpsCockpit-Action", "restart")
+	rr := httptest.NewRecorder()
+	s.HandleRestart(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("first restart code = %d, want 202", rr.Code)
+	}
+	// Immediate second → 429 cooldown.
+	req2 := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
+	req2.Header.Set("X-OpsCockpit-Action", "restart")
+	rr2 := httptest.NewRecorder()
+	s.HandleRestart(rr2, req2)
+	if rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second restart code = %d, want 429", rr2.Code)
+	}
+}
+
+// restartReq builds a valid restart request (POST + action header).
+func restartReq(method, path string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, path, body)
+	req.Header.Set("X-OpsCockpit-Action", "restart")
+	return req
+}
+
 func TestHandleRestartDisabled(t *testing.T) {
 	s := newTestServer(t, testState(true))
-	req := httptest.NewRequest("POST", "/api/services/xray/restart", nil)
+	req := restartReq("POST", "/api/services/xray/restart", nil)
 	rr := httptest.NewRecorder()
 	s.HandleRestart(rr, req)
 	if rr.Code != http.StatusForbidden {
@@ -198,7 +254,7 @@ func TestHandleRestartDisabled(t *testing.T) {
 func TestHandleRestartMaliciousID(t *testing.T) {
 	s := newTestServer(t, testState(true))
 	for _, id := range []string{"nginx;reboot", "hysteria2%20%26%20reboot", "../../etc/passwd", "Nginx", "hysteria-server.service"} {
-		req := httptest.NewRequest("POST", "/api/services/"+id+"/restart", nil)
+		req := restartReq("POST", "/api/services/"+id+"/restart", nil)
 		rr := httptest.NewRecorder()
 		s.HandleRestart(rr, req)
 		if rr.Code != http.StatusBadRequest && rr.Code != http.StatusNotFound {
@@ -211,7 +267,7 @@ func TestHandleRestartBodyRejected(t *testing.T) {
 	s := newTestServer(t, testState(true))
 	// A client smuggling a unit name in the body must be rejected.
 	body := bytes.NewBufferString(`{"unit":"hysteria-server.service","command":"rm -rf /"}`)
-	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", body)
+	req := restartReq("POST", "/api/services/hysteria2/restart", body)
 	rr := httptest.NewRecorder()
 	s.HandleRestart(rr, req)
 	if rr.Code != http.StatusBadRequest {
@@ -221,7 +277,7 @@ func TestHandleRestartBodyRejected(t *testing.T) {
 
 func TestHandleRestartMethodNotAllowed(t *testing.T) {
 	s := newTestServer(t, testState(true))
-	req := httptest.NewRequest("GET", "/api/services/hysteria2/restart", nil)
+	req := restartReq("GET", "/api/services/hysteria2/restart", nil)
 	rr := httptest.NewRecorder()
 	s.HandleRestart(rr, req)
 	if rr.Code != http.StatusMethodNotAllowed {
@@ -243,6 +299,7 @@ func TestServeHTTPRoutes(t *testing.T) {
 	}
 	for _, c := range cases {
 		req := httptest.NewRequest(c.method, c.path, nil)
+		req.Header.Set("X-OpsCockpit-Action", "restart") // required for restart routes
 		rr := httptest.NewRecorder()
 		s.ServeHTTP(rr, req)
 		if rr.Code != c.want {

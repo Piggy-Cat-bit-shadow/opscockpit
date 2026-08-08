@@ -24,6 +24,51 @@ type Socket struct {
 	ServiceID string
 	// Internal is true for loopback-only binds (127.0.0.1, ::1, or 127.x).
 	Internal bool
+	// ProcessCount aggregates how many processes/sockets share this logical
+	// listener (Nginx workers, reuseport, IPv4+IPv6 any-binds).
+	ProcessCount int
+}
+
+// Normalize deduplicates sockets that describe the same logical listener:
+// same (protocol, address, port, service_id). Real hosts produce near-duplicate
+// rows (multiple Nginx workers sharing UDP/853, reuseport, IPv4+IPv6 any
+// binds). Only the first is kept; ProcessCount records how many were merged.
+// Deterministic: input order is preserved for the first of each group.
+func Normalize(socks []Socket) []Socket {
+	seen := map[string]int{} // key → index of the kept socket
+	out := []Socket{}
+	for _, s := range socks {
+		key := s.Protocol + "|" + s.Address + "|" + itoa(s.Port) + "|" + s.ServiceID
+		if i, ok := seen[key]; ok {
+			out[i].ProcessCount++
+			continue
+		}
+		seen[key] = len(out)
+		if s.ProcessCount == 0 {
+			s.ProcessCount = 1
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	b := []byte{}
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	if neg {
+		b = append([]byte{'-'}, b...)
+	}
+	return string(b)
 }
 
 // IsLoopback reports whether an address is loopback-only.

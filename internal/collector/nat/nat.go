@@ -38,8 +38,9 @@ type Ingress struct {
 	SourcePortEnd   int         `json:"source_port_end"` // inclusive
 	TargetPort      int         `json:"target_port"`
 	Type            IngressType `json:"type"`
-	Public          bool        `json:"public"`          // false = loopback/internal mapping
+	Public          bool        `json:"public"`                // false = loopback/internal mapping
 	TargetAddress   string      `json:"target_address,omitempty"` // for DNAT (e.g. container IP)
+	Dest            string      `json:"dest,omitempty"`        // rule destination ("" = any)
 }
 
 // Status is the normalized NAT snapshot.
@@ -66,9 +67,21 @@ type Runner interface {
 	IptablesNat(ctx context.Context) (string, error)
 }
 
+// HostIdentity is the minimal host-address check the NAT collector needs to
+// verify a rule's destination belongs to this machine. Supplied by the
+// network identity collector via the collect layer.
+type HostIdentity interface {
+	// OwnsAddress reports whether addr (host part, no prefix) is a
+	// non-loopback address actually on this host.
+	OwnsAddress(addr string) bool
+}
+
 // Collect reads the nat table. Any failure degrades to Visible=false, never an
-// error the caller must handle.
-func Collect(ctx context.Context, r Runner) Status {
+// error the caller must handle. When host is non-nil, only rules whose
+// destination belongs to this host (or matches any/unspecified) are kept as
+// public ingress — a REDIRECT to an address this machine does not own cannot
+// be this server's entry point.
+func Collect(ctx context.Context, r Runner, host HostIdentity) Status {
 	if r == nil {
 		return Status{Visible: false}
 	}
@@ -78,6 +91,37 @@ func Collect(ctx context.Context, r Runner) Status {
 	}
 	st := Parse(out)
 	st.Visible = true
+	if host != nil {
+		st = filterToHost(st, host)
+	}
+	return st
+}
+
+// filterToHost keeps only ingresses whose destination matches the host. A
+// rule with no explicit destination (matches any) is kept. A rule with a
+// destination this host does not own is dropped.
+func filterToHost(st Status, host HostIdentity) Status {
+	var kept []Ingress
+	for _, ing := range st.Ingresses {
+		if !ing.Public {
+			// Internal mappings are kept but never public.
+			kept = append(kept, ing)
+			continue
+		}
+		dst := ing.Dest
+		if dst == "" || dst == "any" || dst == "0.0.0.0" || dst == "::" {
+			kept = append(kept, ing)
+			continue
+		}
+		if host.OwnsAddress(dst) {
+			kept = append(kept, ing)
+			continue
+		}
+		// Destination not owned by this host → drop as public ingress.
+		ing.Public = false
+		kept = append(kept, ing)
+	}
+	st.Ingresses = kept
 	return st
 }
 
@@ -149,6 +193,14 @@ func parseRule(line string) (Ingress, bool) {
 	// Determine publicness from the destination/interface, not from dport.
 	ing.Public = isPublicIngress(line)
 	ing.Type = TypeDNAT
+	// Record the rule destination (host part) for host-ownership checks.
+	if md := dstRe.FindStringSubmatch(line); md != nil {
+		d := md[1]
+		if i := strings.Index(d, "/"); i >= 0 {
+			d = d[:i]
+		}
+		ing.Dest = strings.Trim(d, "[]")
+	}
 	if jump == "REDIRECT" {
 		ing.Type = TypeRedirect
 		if mt := toPortsRe.FindStringSubmatch(line); mt != nil {

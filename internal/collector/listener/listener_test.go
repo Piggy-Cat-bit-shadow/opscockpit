@@ -191,3 +191,38 @@ func TestParseMalformedLine(t *testing.T) {
 		t.Fatal("expected error on malformed line")
 	}
 }
+
+func TestNormalizeDedup(t *testing.T) {
+	socks := []Socket{
+		{Protocol: "udp", Address: "0.0.0.0", Port: 853, ServiceID: "adguard", PID: 101},
+		{Protocol: "udp", Address: "0.0.0.0", Port: 853, ServiceID: "adguard", PID: 102},
+		{Protocol: "udp", Address: "0.0.0.0", Port: 853, ServiceID: "adguard", PID: 103},
+		{Protocol: "tcp", Address: "0.0.0.0", Port: 853, ServiceID: "adguard", PID: 101},
+		{Protocol: "udp", Address: "0.0.0.0", Port: 853, ServiceID: "xray", PID: 201},
+	}
+	out := Normalize(socks)
+	if len(out) != 3 {
+		t.Fatalf("normalized = %d, want 3 (dedup 3×udp adguard, keep tcp + different svc): %+v", len(out), out)
+	}
+	if out[0].ProcessCount != 3 {
+		t.Errorf("udp 853 adguard process_count = %d, want 3", out[0].ProcessCount)
+	}
+	if out[1].ProcessCount != 1 || out[2].ProcessCount != 1 {
+		t.Errorf("other process counts wrong: %+v", out)
+	}
+}
+
+func TestNormalizePreservesOrder(t *testing.T) {
+	socks := []Socket{
+		{Protocol: "tcp", Address: "0.0.0.0", Port: 443, ServiceID: "nginx", PID: 1},
+		{Protocol: "udp", Address: "::", Port: 443, ServiceID: "hysteria", PID: 2},
+		{Protocol: "tcp", Address: "0.0.0.0", Port: 443, ServiceID: "nginx", PID: 5},
+	}
+	out := Normalize(socks)
+	if out[0].PID != 1 || out[1].PID != 2 || len(out) != 2 {
+		t.Errorf("normalize order wrong: %+v", out)
+	}
+	if out[0].ProcessCount != 2 {
+		t.Errorf("nginx worker count = %d, want 2", out[0].ProcessCount)
+	}
+}

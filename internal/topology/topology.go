@@ -85,7 +85,17 @@ type protoSvc struct {
 type Options struct {
 	// IncludeInternetRoot adds the Internet root node.
 	IncludeInternetRoot bool
+	// MaxNodes bounds the total node count (explosion guard). 0 = default 500.
+	MaxNodes int
+	// MaxEdges bounds the total edge count. 0 = default 1000.
+	MaxEdges int
 }
+
+// Defaults guard against pathological configs producing thousands of nodes.
+const (
+	defaultMaxNodes = 500
+	defaultMaxEdges = 1000
+)
 
 // ID schemes (stable across runs).
 const internetID = "internet"
@@ -112,6 +122,17 @@ func depInstanceID(serviceID, proto string, port int) string {
 // Generate produces the deterministic port tree.
 func Generate(in Input, opts Options) (state.Topology, error) {
 	t := state.Topology{}
+	maxNodes := opts.MaxNodes
+	if maxNodes <= 0 {
+		maxNodes = defaultMaxNodes
+	}
+	maxEdges := opts.MaxEdges
+	if maxEdges <= 0 {
+		maxEdges = defaultMaxEdges
+	}
+	// bounded stops appending when the explosion guard is hit. Deterministic:
+	// the same pathological input always stops at the same point.
+	bounded := func() bool { return len(t.Nodes) >= maxNodes || len(t.Edges) >= maxEdges }
 
 	byID := make(map[string]svc.Service, len(in.Services))
 	for _, s := range in.Services {
@@ -207,6 +228,9 @@ func Generate(in Input, opts Options) (state.Topology, error) {
 	emittedDep := map[string]bool{}
 
 	for _, g := range groups {
+		if bounded() {
+			break
+		}
 		pid := portNodeID(g.start, g.end)
 		label := state.PortLabel(g.start, g.end)
 

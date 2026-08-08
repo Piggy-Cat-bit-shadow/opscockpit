@@ -11,21 +11,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/opscockpit/opscockpit/internal/collector/cgroup"
+	"github.com/opscockpit/opscockpit/internal/collector/deps"
 	"github.com/opscockpit/opscockpit/internal/collector/firewall"
 	"github.com/opscockpit/opscockpit/internal/collector/host"
 	"github.com/opscockpit/opscockpit/internal/collector/listener"
 	"github.com/opscockpit/opscockpit/internal/collector/nat"
+	"github.com/opscockpit/opscockpit/internal/collector/network"
+	"github.com/opscockpit/opscockpit/internal/collector/nginx"
 	"github.com/opscockpit/opscockpit/internal/collector/systemd"
 	svc "github.com/opscockpit/opscockpit/internal/collector/config"
 	"github.com/opscockpit/opscockpit/internal/state"
 	"github.com/opscockpit/opscockpit/internal/topology"
 )
 
-// Runner abstracts the systemd + ss + version + firewall + nat command
-// execution. It is the seam tests mock so CI never needs a real host.
+// Runner abstracts the systemd + ss + version + firewall + nat + network
+// command execution. It is the seam tests mock so CI never needs a real host.
 type Runner interface {
 	systemd.Runner
 	// SS returns `ss -H -lntup` output (or fixture text).
@@ -36,6 +40,16 @@ type Runner interface {
 	UFWStatus(ctx context.Context) (string, error)
 	// IptablesNat returns `iptables -t nat -S` output (or fixture text).
 	IptablesNat(ctx context.Context) (string, error)
+	// IPAddrJSON returns `ip -j addr show` output (or fixture text).
+	IPAddrJSON(ctx context.Context) (string, error)
+	// IPRouteJSON returns `ip -j route show` output (or fixture text).
+	IPRouteJSON(ctx context.Context) (string, error)
+	// NginxT returns `nginx -T` output (or fixture text). Empty/nil is fine —
+	// nginx is optional and its absence never fails a collect.
+	NginxT(ctx context.Context) (string, error)
+	// DockerPS returns `docker ps -a --format ...` output (or fixture text).
+	// Empty/nil is fine — Docker is optional.
+	DockerPS(ctx context.Context) (string, error)
 }
 
 // Options configures a collection run.
@@ -98,9 +112,10 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 	}
 	listener.SortByPort(sockets)
 
-	// --- firewall + NAT exposure evidence ---
+	// --- firewall + NAT + network exposure evidence ---
 	fw := firewall.Collect(ctx, r)
-	natStatus := nat.Collect(ctx, r)
+	hostNet := network.Collect(ctx, r)
+	natStatus := nat.Collect(ctx, r, hostNet)
 
 	// --- services ---
 	// Map listener → service via PID → cgroup → systemd unit is done by the
@@ -117,6 +132,9 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 		}
 		svcSockets = append(svcSockets, s)
 	}
+	// Normalize: Nginx workers / reuseport / IPv4+IPv6 any-binds collapse into
+	// one logical listener per (proto,addr,port,service), with process_count.
+	svcSockets = listener.Normalize(svcSockets)
 
 	// --- service entries ---
 	if servicesCfg != nil {
@@ -129,8 +147,10 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 				Status:         state.StatusUnknown,
 			}
 			if p := s.FirstConfigPath(); p != "" {
-				entry.ConfigPath = p
-				entry.ConfigExists = configExists(opts, p)
+				// Canonicalize: require absolute, clean . / .., resolve symlinks.
+				canon := svc.ResolveConfigPath(p)
+				entry.ConfigPath = canon
+				entry.ConfigExists = configExists(opts, canon)
 			}
 			// Version (best effort; failure → "" = unknown, never a fault).
 			if argv := s.VersionCommand(); len(argv) > 0 {
@@ -150,7 +170,7 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 	}
 
 	topoListeners := []topology.Listener{}
-	deps := map[string][]topology.Dependency{}
+	depEdges := map[string][]topology.Dependency{}
 	unitStateByID := map[string]systemd.UnitStatus{}
 	activeByID := map[string]bool{}
 	requiredListenersByID := map[string][]string{}
@@ -173,8 +193,9 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 		svcCfg := exposureOverride(sk.ServiceID)
 
 		// Classify exposure. A wildcard bind is only a binding scope — whether
-		// it is reachable depends on firewall evidence + overrides.
-		exposure := classifyExposure(sk, fw, natStatus, svcCfg)
+		// it is reachable depends on firewall evidence + overrides. IPv4 and
+		// IPv6 are judged separately against the host's actual addresses.
+		exposure := classifyExposure(sk, fw, hostNet, svcCfg)
 
 		entry.Listeners = append(entry.Listeners, state.Listener{
 			Protocol: sk.Protocol,
@@ -255,12 +276,16 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 		if unit == "" {
 			continue
 		}
+		// Uninstantiated template units (foo@.service) are not runtime services.
+		if systemd.IsTemplateUnit(unit) {
+			continue
+		}
 		us, err := systemd.ShowUnit(ctx, r, unit)
 		if err != nil {
 			continue
 		}
 		entry.UnitState = us.ActiveState
-		active := us.ActiveState == "active"
+		active := us.IsHealthyActive()
 		activeByID[entry.ID] = active
 		unitStateByID[entry.ID] = us
 
@@ -289,6 +314,17 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 		}
 	}
 
+	// --- Dependency resolution (best effort, never fatal). Runs after unit
+	// state so declared upstream endpoints can read ExecStart. Nginx is
+	// optional; declared upstreams run regardless. ---
+	if ngxOut, err := r.NginxT(ctx); err == nil && ngxOut != "" {
+		collectNginxDeps(ctx, r, servicesCfg, topoListeners, st, &depEdges, unitStateByID)
+	}
+	collectDeclaredUpstreams(servicesCfg, topoListeners, &depEdges, unitStateByID)
+
+	// --- Docker service health (best effort, never fatal). ---
+	collectDockerHealth(ctx, r, servicesCfg, st)
+
 	// Final per-service status.
 	for i := range st.Services {
 		entry := &st.Services[i]
@@ -296,7 +332,20 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 		if unit != "" {
 			active := activeByID[entry.ID]
 			us := unitStateByID[entry.ID]
-			status, problems := state.ServiceStatus(active, us.ActiveState, requiredListenersByID[entry.ID], configMissing(opts, entry))
+
+			// require_listener: does this service's health depend on having a
+			// listener at all? auto defers to unit semantics (oneshot → no).
+			reqListener := requireListenerFor(servicesCfg, entry.ID, us.Type)
+
+			var missing []string
+			if reqListener {
+				missing = requiredListenersByID[entry.ID]
+				if len(entry.Listeners) == 0 {
+					missing = append(missing, "no listener for registered service")
+				}
+			}
+
+			status, problems := state.ServiceStatus(active, us.ActiveState, missing, configMissing(opts, entry))
 			entry.Status = status
 			if len(problems) > 0 {
 				entry.Health = &state.HealthInfo{Problems: problems}
@@ -323,7 +372,7 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 		Services:     topoServices,
 		Listeners:    topoListeners,
 		NATIngresses: natIngresses,
-		Dependencies: deps,
+		Dependencies: depEdges,
 	}, topology.Options{IncludeInternetRoot: true})
 	if terr != nil {
 		return Result{}, fmt.Errorf("topology: %w", terr)
@@ -349,6 +398,234 @@ func configMissing(opts Options, entry *state.Service) bool {
 		return false
 	}
 	return !configExists(opts, entry.ConfigPath)
+}
+
+// requireListenerFor resolves health.require_listener (auto/true/false) for a
+// service. auto defers to unit semantics: oneshot apply-rule units do not
+// require a listener; network daemons (simple/forking/etc) do.
+func requireListenerFor(servicesCfg *svc.Config, id, unitType string) bool {
+	if servicesCfg != nil {
+		if s := servicesCfg.ByID(id); s != nil {
+			switch s.RequireListener() {
+			case "true":
+				return true
+			case "false":
+				return false
+			}
+		}
+	}
+	// auto: oneshot units are apply-rule style, no listener required.
+	return unitType != "oneshot"
+}
+
+// collectNginxDeps parses nginx -T and adds service dependencies via the
+// endpoint resolver. Uses the shared deps.Graph for cycle detection and a depth
+// bound. Static-resource targets (a directory) terminate the chain and never
+// invent a service.
+func collectNginxDeps(ctx context.Context, r Runner, servicesCfg *svc.Config, topoListeners []topology.Listener, st *state.State, out *map[string][]topology.Dependency, unitState map[string]systemd.UnitStatus) {
+	ngxOut, err := r.NginxT(ctx)
+	if err != nil || ngxOut == "" {
+		return
+	}
+	cfg := nginx.Parse(ngxOut)
+	if len(cfg.ProxyPasses) == 0 {
+		return
+	}
+
+	// Build the endpoint resolver from all listeners that belong to a
+	// registered service.
+	known := make([]deps.KnownListener, 0, len(topoListeners))
+	for _, l := range topoListeners {
+		known = append(known, deps.KnownListener{
+			Host:      l.Address,
+			Port:      l.Port,
+			ServiceID: l.ServiceID,
+			Loopback:  l.Internal,
+		})
+	}
+	resolver := deps.NewResolver(known)
+
+	graph := deps.NewGraph(5, 200)
+
+	// Map server listen port → owning service id.
+	portOwner := map[int]string{}
+	for _, l := range topoListeners {
+		if _, ok := portOwner[l.Port]; !ok {
+			portOwner[l.Port] = l.ServiceID
+		}
+	}
+
+	// Resolve each proxy_pass to concrete endpoints.
+	endpointsByServer := cfg.ResolveProxyTargets()
+	for serverPort, endpoints := range endpointsByServer {
+		owner := portOwner[serverPort]
+		if owner == "" {
+			continue
+		}
+		for _, ep := range endpoints {
+			svcID := resolver.Resolve(ep)
+			if svcID == "" {
+				// Static dirs / unresolved endpoints terminate the chain.
+				continue
+			}
+			graph.AddEdge(owner, svcID, state.EvidenceNginxProxyPass, state.ConfidenceConfigured, ep)
+		}
+	}
+
+	// Emit edges into the topology dependencies map.
+	for src, ds := range graph.Edges {
+		for _, d := range ds {
+			(*out)[src] = append((*out)[src], topology.Dependency{
+				TargetServiceID: d.TargetServiceID,
+				Source:          d.Source,
+				Confidence:      d.Confidence,
+			})
+		}
+	}
+}
+
+// collectDockerHealth merges Docker container health into services that are
+// Docker-backed (services.yaml docker.container). Docker is optional; on any
+// error it is skipped and never fails a collect.
+//
+// Health mapping:
+//   - container stopped → failed
+//   - running + unhealthy → warning
+//   - running + starting → unknown
+//   - running + healthy (or no HEALTHCHECK) → not a fault
+func collectDockerHealth(ctx context.Context, r Runner, servicesCfg *svc.Config, st *state.State) {
+	if servicesCfg == nil {
+		return
+	}
+	out, err := r.DockerPS(ctx)
+	if err != nil || out == "" {
+		return
+	}
+	containers := dockerExecClient(r).ListFromPS(out)
+
+	// Map container name → health.
+	byName := map[string]dockerContainerHealth{}
+	for _, c := range containers {
+		byName[c.Name] = dockerContainerHealth{Running: c.Running, Health: c.Health}
+	}
+
+	for i := range st.Services {
+		s := st.Services[i]
+		cfg := servicesCfg.ByID(s.ID)
+		if cfg == nil || cfg.DockerContainer() == "" {
+			continue
+		}
+		h, ok := byName[cfg.DockerContainer()]
+		if !ok {
+			continue
+		}
+		switch {
+		case !h.Running:
+			st.Services[i].Status = state.StatusFailed
+			st.Services[i].Health = &state.HealthInfo{Problems: []string{"container not running"}}
+		case h.Health == "unhealthy":
+			st.Services[i].Status = state.StatusWarning
+			st.Services[i].Health = &state.HealthInfo{Problems: []string{"container unhealthy"}}
+		case h.Health == "starting":
+			st.Services[i].Status = state.StatusUnknown
+			st.Services[i].Health = &state.HealthInfo{Problems: []string{"container starting"}}
+		default:
+			// healthy or no HEALTHCHECK → not a fault.
+			if st.Services[i].Status == state.StatusUnknown {
+				st.Services[i].Status = state.StatusHealthy
+			}
+		}
+	}
+}
+
+// dockerContainerHealth is a minimal container health snapshot.
+type dockerContainerHealth struct {
+	Name    string
+	Running bool
+	Health  string
+}
+
+// dockerExecClient adapts a Runner to the docker ExecClient command interface.
+func dockerExecClient(r Runner) dockerClientLike { return runnerDocker{r: r} }
+
+// dockerClientLike is the subset of the docker client the collect layer needs.
+type dockerClientLike interface {
+	ListFromPS(ps string) []dockerContainerHealth
+}
+
+// runnerDocker adapts a collect Runner's DockerPS output into container facts.
+type runnerDocker struct{ r Runner }
+
+func (rd runnerDocker) ListFromPS(ps string) []dockerContainerHealth {
+	var out []dockerContainerHealth
+	for _, line := range strings.Split(strings.TrimSpace(ps), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 5)
+		if len(parts) < 4 {
+			continue
+		}
+		name := strings.TrimSpace(parts[1])
+		status := strings.TrimSpace(parts[3])
+		health := ""
+		if len(parts) >= 5 {
+			health = strings.TrimSpace(parts[4])
+		}
+		out = append(out, dockerContainerHealth{
+			Name:    name,
+			Running: strings.HasPrefix(status, "Up "),
+			Health:  health,
+		})
+	}
+	return out
+}
+
+// collectDeclaredUpstreams resolves services.yaml topology.upstream_from
+// (exec_arg flag) endpoints to downstream services. Runs regardless of nginx.
+func collectDeclaredUpstreams(servicesCfg *svc.Config, topoListeners []topology.Listener, out *map[string][]topology.Dependency, unitState map[string]systemd.UnitStatus) {
+	if servicesCfg == nil {
+		return
+	}
+	// Build the endpoint resolver.
+	known := make([]deps.KnownListener, 0, len(topoListeners))
+	for _, l := range topoListeners {
+		known = append(known, deps.KnownListener{Host: l.Address, Port: l.Port, ServiceID: l.ServiceID, Loopback: l.Internal})
+	}
+	resolver := deps.NewResolver(known)
+	graph := deps.NewGraph(5, 200)
+
+	for _, s := range servicesCfg.Services {
+		if s.Topology == nil {
+			continue
+		}
+		execStart := ""
+		if us, ok := unitState[s.ID]; ok {
+			execStart = us.ExecStart
+		}
+		for _, src := range s.Topology.UpstreamFrom {
+			if src.Flag == "" {
+				continue
+			}
+			ep := declaredEndpointFromExecStart(execStart, src.Flag)
+			if ep == "" {
+				continue
+			}
+			if target := resolver.Resolve(ep); target != "" {
+				graph.AddEdge(s.ID, target, state.EvidenceManualOverride, state.ConfidenceConfigured, ep)
+			}
+		}
+	}
+
+	for src, ds := range graph.Edges {
+		for _, d := range ds {
+			(*out)[src] = append((*out)[src], topology.Dependency{
+				TargetServiceID: d.TargetServiceID,
+				Source:          d.Source,
+				Confidence:      d.Confidence,
+			})
+		}
+	}
 }
 
 func configExists(opts Options, path string) bool {
@@ -385,18 +662,52 @@ func collectorVersion() string {
 	return "dev"
 }
 
+// allServices returns the registry services (empty if none).
+func allServices(cfg *svc.Config) []svc.Service {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Services
+}
+
+// declaredEndpointFromExecStart reads a specific flag's value from an
+// ExecStart string — the ONLY safe extraction of a declared upstream endpoint.
+// The full ExecStart is never stored or logged. Returns "" when the flag is
+// absent or the value is not a plausible endpoint.
+func declaredEndpointFromExecStart(execStart, flag string) string {
+	if execStart == "" || flag == "" {
+		return ""
+	}
+	fields := strings.Fields(execStart)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == flag {
+			val := strings.TrimSuffix(fields[i+1], ";")
+			// Only accept a plausible host:port endpoint — never a raw secret
+			// or flag value that isn't an endpoint.
+			if strings.Contains(val, ":") {
+				return val
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 // classifyExposure decides a listener's exposure classification.
 //
 // Rules (highest priority first):
 //  1. services.yaml exposure.mode=internal  → internal (override always wins)
 //  2. services.yaml exposure.mode=public    → direct_public (override)
 //  3. loopback bind (127.0.0.1, ::1)        → internal
-//  4. firewall active + explicit allow for (proto, port) → direct_public
-//  5. firewall active + default deny, no allow            → internal (filtered)
-//  6. firewall unknown/inactive, no override              → unknown
+//  4. firewall active + explicit public allow for (proto, port) → direct_public
+//  5. firewall active + allow but restricted/private source → internal
+//  6. firewall active + default deny, no allow            → internal (filtered)
+//  7. firewall unknown/inactive, no override              → unknown
 //
-// A wildcard bind (0.0.0.0, ::) is never public by itself.
-func classifyExposure(s listener.Socket, fw firewall.Status, natStatus nat.Status, svcCfg *svc.Service) string {
+// Per-family (IPv4/IPv6): an IPv6 wildcard bind ([::]) plus an IPv6 UFW rule
+// is NOT a real public service unless the host actually has a global IPv6
+// address and a usable IPv6 route. Same logic for IPv4.
+func classifyExposure(s listener.Socket, fw firewall.Status, hostNet network.Identity, svcCfg *svc.Service) string {
 	// Overrides first.
 	if svcCfg != nil {
 		switch svcCfg.ExposureMode() {
@@ -412,13 +723,27 @@ func classifyExposure(s listener.Socket, fw firewall.Status, natStatus nat.Statu
 		return state.ExposureInternal
 	}
 
-	// Firewall evidence.
+	// Per-family reachability: does the host actually have the address family?
+	family := "ipv4"
+	if s.Address == "::" || strings.Contains(s.Address, ":") {
+		family = "ipv6"
+	}
+	// The socket must bind on an address family the host actually has a global
+	// address + default route for; otherwise it is not publicly reachable.
+	if !hostNet.HasAddressFamily(family) || !hostNet.HasDefaultRoute(family) {
+		// The host has no usable global address/route for this family — a
+		// wildcard bind on it cannot be a real public service.
+		return state.ExposureInternal
+	}
+
+	// Firewall evidence, public-source only.
 	switch fw.Visibility {
 	case firewall.VisibilityActive:
-		if fw.AllowedIn(s.Protocol, s.Port) {
+		if fw.IsPubliclyAllowed(s.Protocol, s.Port) {
 			return state.ExposureDirectPublic
 		}
-		// Active firewall but no allow for this port: filtered.
+		// Allowed but restricted/private source, or not allowed at all under a
+		// default-deny policy: filtered.
 		return state.ExposureInternal
 	default:
 		// Firewall inactive/missing/unparseable: we cannot claim public.
