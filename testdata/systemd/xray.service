@@ -1,7 +1,0 @@
-ActiveState=active
-SubState=running
-MainPID=5005
-ControlGroup=/system.slice/xray.service
-FragmentPath=/etc/systemd/system/xray.service
-Result=success
-LoadState=loaded

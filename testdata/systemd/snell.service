@@ -1,7 +1,0 @@
-ActiveState=active
-SubState=running
-MainPID=5005
-ControlGroup=/system.slice/snell.service
-FragmentPath=/etc/systemd/system/snell.service
-Result=success
-LoadState=loaded
