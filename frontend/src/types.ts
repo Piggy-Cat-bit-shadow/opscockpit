@@ -26,6 +26,7 @@ export interface Listener {
   internal: boolean
   pid?: number
   process?: string
+  exposure?: string
 }
 
 export interface HealthInfo {

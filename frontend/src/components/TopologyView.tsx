@@ -8,18 +8,25 @@ import {
   type NodeMouseHandler,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import type { State } from '@/types'
-import { applyDagreLayout } from '@/layout'
+import type { FocusGraph, FocusNode } from '@/topology'
+import { applyFocusLayout } from '@/layout'
 import { nodeTypes } from '@/components/nodes'
 import { COLORS } from '@/theme'
 
 interface Props {
-  state: State
+  graph: FocusGraph
+  selectedServiceId?: string
   onSelectService: (serviceId: string) => void
 }
 
-export function TopologyView({ state, onSelectService }: Props) {
-  const layout = useMemo(() => applyDagreLayout(state.topology.nodes, state.topology.edges), [state])
+/**
+ * TopologyCanvas renders ONE Focus subgraph with React Flow, left→right, at a
+ * readable zoom. It never fitViews the whole 48-node tree — the graph shown is
+ * small by construction (Port Focus / Service Focus). Selected-path edges are
+ * highlighted; unrelated edges dim.
+ */
+export function TopologyCanvas({ graph, selectedServiceId, onSelectService }: Props) {
+  const layout = useMemo(() => applyFocusLayout(graph), [graph])
 
   const [nodes, setNodes, onNodesChange] = useNodesState(layout.nodes)
   const [edges, setEdges, onEdgesChange] = useEdgesState(layout.edges)
@@ -29,11 +36,40 @@ export function TopologyView({ state, onSelectService }: Props) {
     setEdges(layout.edges)
   }, [layout, setNodes, setEdges])
 
+  // Dim edges not on the path to/from the selected service.
+  const highlighted = useMemo(() => {
+    if (!selectedServiceId) return new Set<string>()
+    const set = new Set<string>()
+    const nodeIds = new Set(
+      graph.nodes.filter((n) => n.serviceId === selectedServiceId).map((n) => n.id),
+    )
+    // Any edge touching a selected node is part of the focused path.
+    for (const e of graph.edges) {
+      if (nodeIds.has(e.source) || nodeIds.has(e.target)) set.add(e.id)
+    }
+    return set
+  }, [graph, selectedServiceId])
+
+  const styledEdges = useMemo(
+    () =>
+      edges.map((e) => {
+        const active = highlighted.size === 0 || highlighted.has(e.id)
+        return {
+          ...e,
+          style: {
+            stroke: active ? COLORS.border : `${COLORS.border}33`,
+            strokeWidth: active ? 1.5 : 1,
+          },
+        }
+      }),
+    [edges, highlighted],
+  )
+
   const onNodeClick: NodeMouseHandler = useCallback(
     (_, node) => {
-      const data = node.data as { type?: string; service_id?: string }
-      if (data.type === 'service' && data.service_id) {
-        onSelectService(data.service_id)
+      const data = node.data as FocusNode
+      if (data.type === 'service' && data.serviceId) {
+        onSelectService(data.serviceId)
       }
     },
     [onSelectService],
@@ -43,18 +79,17 @@ export function TopologyView({ state, onSelectService }: Props) {
     <div className="oc-topology">
       <ReactFlow
         nodes={nodes}
-        edges={edges}
+        edges={styledEdges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         onNodeClick={onNodeClick}
         fitView
-        fitViewOptions={{ padding: 0.25, maxZoom: 1.2 }}
-        minZoom={0.2}
+        fitViewOptions={{ padding: 0.3, minZoom: 0.85, maxZoom: 1 }}
+        minZoom={0.5}
         maxZoom={2}
-        proOptions={{ hideAttribution: false }}
         nodesConnectable={false}
-        nodesDraggable={false}
+        nodesDraggable
         elementsSelectable
         defaultEdgeOptions={{ style: { stroke: COLORS.border, strokeWidth: 1.5 } }}
         colorMode="dark"

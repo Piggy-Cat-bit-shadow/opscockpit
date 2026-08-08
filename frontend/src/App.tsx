@@ -1,18 +1,27 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { ArrowLeft } from 'lucide-react'
 import type { State } from '@/types'
 import { validateState, SchemaError } from '@/types'
 import { createPollController, restartService } from '@/api'
 import { HostSummary } from '@/components/HostSummary'
-import { TopologyView } from '@/components/TopologyView'
-import { ServiceList } from '@/components/ServiceList'
-import { DetailDrawer } from '@/components/DetailDrawer'
-import { MobileTopology, BottomSheet } from '@/components/MobileTopology'
+import { TopologyCanvas } from '@/components/TopologyView'
+import { IngressBoard } from '@/components/IngressBoard'
+import { ServiceRail } from '@/components/ServiceRail'
+import { InspectorDrawer } from '@/components/InspectorDrawer'
+import { MobileTopology } from '@/components/MobileTopology'
+import { buildIngressBoard, buildPortFocus, buildServiceFocus, type FocusGraph } from '@/topology'
 import { COLORS } from '@/theme'
+
+type Mode =
+  | { kind: 'overview' }
+  | { kind: 'port'; start: number; end: number }
+  | { kind: 'service'; serviceId: string }
 
 export default function App() {
   const [state, setState] = useState<State | null>(null)
   const [error, setError] = useState<{ title: string; detail: string } | null>(null)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [mode, setMode] = useState<Mode>({ kind: 'overview' })
+  const [inspectedId, setInspectedId] = useState<string | null>(null)
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
 
   const onData = useCallback((s: State) => {
@@ -20,8 +29,6 @@ export default function App() {
     setError(null)
   }, [])
   const onError = useCallback((e: unknown) => {
-    // Schema/malformed errors are shown clearly; network errors say the API
-    // is unreachable. Never white-screen.
     if (e instanceof SchemaError) {
       setError({ title: e.kind === 'schema' ? 'Schema mismatch' : 'State unavailable', detail: e.message })
     } else {
@@ -47,14 +54,69 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize)
   }, [])
 
-  const selectedService = useMemo(() => {
-    if (!state || !selectedId) return null
-    return state.services.find((s) => s.id === selectedId) ?? null
-  }, [state, selectedId])
-
   const handleRestart = useCallback(async (serviceId: string) => {
     await restartService(serviceId)
   }, [])
+
+  const cards = useMemo(() => (state ? buildIngressBoard(state.topology) : []), [state])
+
+  const focusGraph: FocusGraph | null = useMemo(() => {
+    if (!state) return null
+    if (mode.kind === 'port') return buildPortFocus(state.topology, mode.start, mode.end)
+    if (mode.kind === 'service') return buildServiceFocus(state.topology, mode.serviceId)
+    return null
+  }, [state, mode])
+
+  const focusTitle = useMemo(() => {
+    if (!state) return ''
+    if (mode.kind === 'port') {
+      return mode.start === mode.end ? `${mode.start}` : `${mode.start}–${mode.end}`
+    }
+    if (mode.kind === 'service') {
+      return state.services.find((s) => s.id === mode.serviceId)?.name ?? mode.serviceId
+    }
+    return ''
+  }, [state, mode])
+
+  const inspectedService = useMemo(() => {
+    if (!state || !inspectedId) return null
+    return state.services.find((s) => s.id === inspectedId) ?? null
+  }, [state, inspectedId])
+
+  const openPort = useCallback((start: number, end: number) => {
+    setMode({ kind: 'port', start, end })
+    setInspectedId(null)
+  }, [])
+
+  const openService = useCallback((serviceId: string) => {
+    setMode({ kind: 'service', serviceId })
+    setInspectedId(null)
+  }, [])
+
+  const backToOverview = useCallback(() => {
+    setMode({ kind: 'overview' })
+    setInspectedId(null)
+  }, [])
+
+  const selectService = useCallback((serviceId: string) => {
+    setInspectedId(serviceId)
+  }, [])
+
+  const onKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (inspectedId) setInspectedId(null)
+        else setMode({ kind: 'overview' })
+      }
+    },
+    [inspectedId],
+  )
+  useEffect(() => {
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onKeyDown])
+
+  const inFocus = mode.kind !== 'overview'
 
   return (
     <div className="oc-app">
@@ -89,8 +151,13 @@ export default function App() {
             </span>
           </div>
           <HostSummary state={state} />
-          <MobileTopology state={state} selectedId={selectedId ?? undefined} onSelectService={setSelectedId} />
-          <BottomSheet service={selectedService} onClose={() => setSelectedId(null)} onRestart={handleRestart} />
+          <MobileTopology
+            state={state}
+            selectedService={inspectedService}
+            onSelectService={(id) => setInspectedId(id)}
+            onCloseDetail={() => setInspectedId(null)}
+            onRestart={handleRestart}
+          />
         </div>
       )}
 
@@ -104,17 +171,46 @@ export default function App() {
           </header>
 
           <div className="oc-main">
-            <div className="oc-col oc-col-left">
-              <HostSummary state={state} />
-              <div className="oc-topology-wrap">
-                <TopologyView state={state} onSelectService={setSelectedId} />
+            <div className="oc-col-main">
+              <div className="oc-toolbar">
+                {inFocus && (
+                  <button className="oc-toolbar-btn" onClick={backToOverview}>
+                    <ArrowLeft size={13} /> All ingress
+                  </button>
+                )}
+                <span className="oc-toolbar-title">
+                  {mode.kind === 'overview' ? 'Ingress' : mode.kind === 'port' ? `Port ${focusTitle}` : `Service · ${focusTitle}`}
+                </span>
+                <span className="oc-toolbar-spacer" />
+                {mode.kind === 'service' && (
+                  <button className="oc-toolbar-btn" onClick={backToOverview}>
+                    Reset
+                  </button>
+                )}
+              </div>
+
+              <div className="oc-content">
+                {mode.kind === 'overview' ? (
+                  <div className="oc-overview-scroll">
+                    <IngressBoard cards={cards} onOpenPort={openPort} />
+                  </div>
+                ) : (
+                  focusGraph && <TopologyCanvas graph={focusGraph} selectedServiceId={inspectedId ?? undefined} onSelectService={selectService} />
+                )}
               </div>
             </div>
+
             <div className="oc-col-right">
-              <ServiceList services={state.services} selectedId={selectedId ?? undefined} onSelect={setSelectedId} />
-              <DetailDrawer service={selectedService} onClose={() => setSelectedId(null)} onRestart={handleRestart} />
+              <ServiceRail services={state.services} selectedId={inspectedId ?? undefined} onSelect={openService} />
             </div>
           </div>
+
+          <InspectorDrawer
+            service={inspectedService}
+            topology={state.topology}
+            onClose={() => setInspectedId(null)}
+            onRestart={handleRestart}
+          />
         </div>
       )}
     </div>

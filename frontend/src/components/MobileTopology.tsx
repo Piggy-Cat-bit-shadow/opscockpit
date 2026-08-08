@@ -1,118 +1,22 @@
 import { useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-import type { State } from '@/types'
-import { buildPortTree, formatBytes } from '@/types'
+import type { Service, State } from '@/types'
+import { formatBytes } from '@/types'
+import { buildIngressBoard } from '@/topology'
 import { STATUS_LABEL, STATUS_COLORS } from '@/theme'
 
 interface Props {
   state: State
-  selectedId?: string
+  selectedService?: Service | null
   onSelectService: (serviceId: string) => void
-}
-
-function ServiceLeaf({
-  name,
-  status,
-  onSelect,
-  active,
-}: {
-  name: string
-  status?: string
-  onSelect: () => void
-  active: boolean
-}) {
-  const color = (status && STATUS_COLORS[status as keyof typeof STATUS_COLORS]) || '#6b7280'
-  return (
-    <button className={`oc-tree-leaf ${active ? 'oc-tree-leaf-active' : ''}`} onClick={onSelect}>
-      <span className="oc-tree-dot" style={{ background: color }} />
-      <span className="oc-tree-leaf-name">{name}</span>
-    </button>
-  )
-}
-
-export function MobileTopology({ state, selectedId, onSelectService }: Props) {
-  const tree = useMemo(() => buildPortTree(state.topology), [state.topology])
-  const [openPorts, setOpenPorts] = useState<Set<string>>(() => new Set(tree.map((p) => p.label)))
-  const [openProtos, setOpenProtos] = useState<Set<string>>(() => new Set())
-
-  const togglePort = (label: string) => {
-    setOpenPorts((prev) => {
-      const next = new Set(prev)
-      if (next.has(label)) next.delete(label)
-      else next.add(label)
-      return next
-    })
-  }
-
-  const toggleProto = (key: string) => {
-    setOpenProtos((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      return next
-    })
-  }
-
-  if (tree.length === 0) {
-    return <div className="oc-tree-empty">No public services listening.</div>
-  }
-
-  return (
-    <div className="oc-tree">
-      <div className="oc-tree-internet">Internet</div>
-      {tree.map((p) => {
-        const open = openPorts.has(p.label)
-        return (
-          <div key={p.label} className="oc-tree-port">
-            <button className="oc-tree-port-head" onClick={() => togglePort(p.label)}>
-              {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-              <span className="oc-tree-port-num">{p.label}</span>
-            </button>
-            {open &&
-              p.protocols.map((pr) => {
-                const key = `${p.label}-${pr.protocol}`
-                const openP = openProtos.has(key)
-                return (
-                  <div key={key} className="oc-tree-proto">
-                    <button className="oc-tree-proto-head" onClick={() => toggleProto(key)}>
-                      {openP ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-                      <span className="oc-tree-proto-label">{pr.protocol.toUpperCase()}</span>
-                    </button>
-                    {openP &&
-                      pr.services.map((s) => (
-                        <ServiceLeaf
-                          key={s.instanceId}
-                          name={s.name}
-                          status={s.status}
-                          active={s.serviceId === selectedId}
-                          onSelect={() => onSelectService(s.serviceId)}
-                        />
-                      ))}
-                  </div>
-                )
-              })}
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-export function BottomSheet({
-  service,
-  onClose,
-  onRestart,
-}: {
-  service: NonNullable<State['services'][number]> | null
-  onClose: () => void
+  onCloseDetail: () => void
   onRestart: (serviceId: string) => Promise<void>
-}) {
+}
+
+function MobileDetail({ service, onRestart, onClose }: { service: Service; onRestart: (id: string) => Promise<void>; onClose: () => void }) {
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-
-  if (!service) return null
-
   const color = STATUS_COLORS[service.status] ?? '#6b7280'
   const doRestart = async () => {
     setBusy(true)
@@ -126,7 +30,6 @@ export function BottomSheet({
       setBusy(false)
     }
   }
-
   return (
     <div className="oc-sheet-backdrop" onClick={onClose}>
       <div className="oc-sheet" onClick={(e) => e.stopPropagation()}>
@@ -189,6 +92,55 @@ export function BottomSheet({
           Close
         </button>
       </div>
+    </div>
+  )
+}
+
+export function MobileTopology({ state, selectedService, onSelectService, onCloseDetail, onRestart }: Props) {
+  const cards = useMemo(() => buildIngressBoard(state.topology), [state.topology])
+  const [open, setOpen] = useState<Record<string, boolean>>({})
+
+  if (cards.length === 0) {
+    return <div className="oc-tree-empty">No public ingress discovered.</div>
+  }
+
+  return (
+    <div className="oc-mobile-flow">
+      {cards.map((c) => {
+        const isOpen = !!open[c.label]
+        return (
+          <div key={c.label} className="oc-mcard">
+            <button className="oc-mcard-head" onClick={() => setOpen((o) => ({ ...o, [c.label]: !o[c.label] }))}>
+              {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              <span className="oc-mcard-port">{c.label}</span>
+              {c.exposure && <span className="oc-card-exposure">{c.exposure === 'nat_ingress' ? 'NAT' : c.exposure}</span>}
+            </button>
+            {isOpen && (
+              <div className="oc-mcard-body">
+                {c.protocols.map((p) => (
+                  <div key={p.protocol} className="oc-mproto">
+                    <span className={`oc-card-proto-badge oc-card-proto-${p.protocol}`}>{p.protocol.toUpperCase()}</span>
+                    <div className="oc-mproto-services">
+                      {p.natTarget != null && <span className="oc-card-nat">NAT → {p.natTarget}</span>}
+                      {p.serviceIds.map((id) => {
+                        const svc = state.services.find((s) => s.id === id)
+                        if (!svc) return null
+                        return (
+                          <button key={id} className="oc-mproto-svc" onClick={() => onSelectService(id)}>
+                            <span className="oc-tree-dot" style={{ background: STATUS_COLORS[svc.status] ?? '#6b7280' }} />
+                            {svc.name}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )
+      })}
+      {selectedService && <MobileDetail service={selectedService} onRestart={onRestart} onClose={onCloseDetail} />}
     </div>
   )
 }
