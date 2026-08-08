@@ -234,6 +234,22 @@ func TestHandleRestartCooldown(t *testing.T) {
 	}
 }
 
+func TestHandleRestartUnavailable(t *testing.T) {
+	// A serve without a configured helper must return explicit unavailable,
+	// never silently succeed.
+	raw, _ := json.Marshal(testState(true))
+	store := &memStore{st: testState(true), raw: raw}
+	s := New(store, restart.NewBroker(nil, restart.NewUnavailableBackend()), http.NotFoundHandler(), false, nil)
+
+	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
+	req.Header.Set("X-OpsCockpit-Action", "restart")
+	rr := httptest.NewRecorder()
+	s.HandleRestart(rr, req)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code = %d, want 503 (unavailable)", rr.Code)
+	}
+}
+
 // restartReq builds a valid restart request (POST + action header).
 func restartReq(method, path string, body io.Reader) *http.Request {
 	req := httptest.NewRequest(method, path, body)

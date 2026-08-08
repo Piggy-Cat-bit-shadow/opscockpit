@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"sync"
 	"time"
@@ -39,12 +40,17 @@ var ErrInvalidID = errors.New("invalid service id")
 // window for the same service.
 var ErrCooldown = errors.New("restart requested too soon; cooldown active")
 
-// Backend actually performs a restart. The real implementation (future phase)
-// would run `systemctl restart <unit>` where <unit> comes from the allowlist
-// entry — never from client input. This phase uses Mock.
+// Backend actually performs a restart. The production implementation does NOT
+// run systemctl/docker directly — it invokes the fixed root helper argv:
+//
+//	sudo -n /usr/local/bin/opscockpit restart-helper --services <path> <id>
+//
+// The helper (running as root) re-reads the root-owned services.yaml and
+// resolves the exact unit/container itself. The web layer never supplies a
+// unit/container/command; only the service id.
 type Backend interface {
-	// Restart restarts a single allowlisted unit.
-	Restart(ctx context.Context, unit string) error
+	// Restart restarts a single allowlisted service id.
+	Restart(ctx context.Context, serviceID string) error
 }
 
 // Mock is the phase-1 backend. It records restarts and can be programmed to
@@ -75,7 +81,7 @@ func (m *Mock) Restarts() []string {
 }
 
 // Restart implements Backend.
-func (m *Mock) Restart(ctx context.Context, unit string) error {
+func (m *Mock) Restart(ctx context.Context, serviceID string) error {
 	m.mu.Lock()
 	if m.fail {
 		m.fail = false
@@ -94,7 +100,7 @@ func (m *Mock) Restart(ctx context.Context, unit string) error {
 	}
 
 	m.mu.Lock()
-	m.restarts = append(m.restarts, unit)
+	m.restarts = append(m.restarts, serviceID)
 	m.mu.Unlock()
 	return nil
 }
@@ -193,7 +199,9 @@ func (b *Broker) Restart(ctx context.Context, id string) error {
 		b.lastRestart[id] = time.Now()
 		b.mu.Unlock()
 	}
-	return b.backend.Restart(ctx, entry.unit)
+	// The backend receives only the service id. It resolves the exact
+	// unit/container from the root-owned registry (second trust boundary).
+	return b.backend.Restart(ctx, id)
 }
 
 // Known reports whether id is in the allowlist (regardless of restart flag).
@@ -203,4 +211,109 @@ func (b *Broker) Known(id string) bool {
 	}
 	_, ok := b.units[id]
 	return ok
+}
+
+// ErrHelperUnavailable is returned when a helper backend is configured but the
+// helper argv could not be constructed (or the helper binary is missing).
+var ErrHelperUnavailable = errors.New("restart helper not available")
+
+// ErrUnavailable is returned when the restart API is served without a
+// configured helper (production must never silently mock a restart).
+var ErrUnavailable = errors.New("restart unavailable: no helper configured")
+
+// UnavailableBackend is the production fallback when no helper is configured.
+// It never pretends a restart happened — every call fails explicitly.
+type UnavailableBackend struct{}
+
+// NewUnavailableBackend returns a backend that always reports unavailable.
+func NewUnavailableBackend() *UnavailableBackend { return &UnavailableBackend{} }
+
+// Restart implements Backend.
+func (u *UnavailableBackend) Restart(ctx context.Context, serviceID string) error {
+	return ErrUnavailable
+}
+
+// HelperConfig configures the production restart backend.
+type HelperConfig struct {
+	// Helper is the opscockpit binary path used as the helper (default
+	// /usr/local/bin/opscockpit).
+	Helper string
+	// ServicesPath is the root-owned services.yaml the helper re-reads.
+	ServicesPath string
+	// Sudo forces invocation via `sudo -n` (production). Empty disables sudo
+	// (dev/test direct helper).
+	Sudo bool
+	// Timeout bounds the helper execution.
+	Timeout time.Duration
+	// MaxOutput caps helper stdout/stderr (2 MiB default).
+	MaxOutput int
+	// Runner executes the helper argv; nil uses exec.CommandContext. Tests
+	// inject a mock.
+	Runner func(ctx context.Context, argv []string) (string, error)
+}
+
+// HelperBackend is the production Backend. It does NOT run systemctl/docker
+// itself — it invokes the fixed helper argv and lets the root helper resolve
+// the exact unit/container from root-owned services.yaml.
+type HelperBackend struct {
+	cfg HelperConfig
+}
+
+// NewHelperBackend builds the production backend. Requires a services path.
+func NewHelperBackend(cfg HelperConfig) (*HelperBackend, error) {
+	if cfg.ServicesPath == "" {
+		return nil, fmt.Errorf("restart helper requires -restart-services path")
+	}
+	if cfg.Helper == "" {
+		cfg.Helper = "/usr/local/bin/opscockpit"
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 20 * time.Second
+	}
+	if cfg.MaxOutput <= 0 {
+		cfg.MaxOutput = 2 << 20
+	}
+	return &HelperBackend{cfg: cfg}, nil
+}
+
+// Restart invokes the fixed helper argv:
+//
+//	[sudo -n] <helper> restart-helper --services <path> <serviceID>
+func (h *HelperBackend) Restart(ctx context.Context, serviceID string) error {
+	if !ServiceIDPattern.MatchString(serviceID) {
+		return ErrInvalidID
+	}
+	argv := []string{h.cfg.Helper, "restart-helper", "--services", h.cfg.ServicesPath, serviceID}
+	if h.cfg.Sudo {
+		argv = append([]string{"sudo", "-n"}, argv...)
+	}
+	// The timeout bounds BOTH the exec path and a custom Runner.
+	cctx, cancel := context.WithTimeout(ctx, h.cfg.Timeout)
+	defer cancel()
+	var out string
+	var err error
+	if h.cfg.Runner != nil {
+		out, err = h.cfg.Runner(cctx, argv)
+	} else {
+		out, err = h.runExec(cctx, argv)
+	}
+	if err != nil {
+		// Never leak helper stdout/stderr (may contain sensitive context) —
+		// return a generic error.
+		if out != "" && len(out) > 120 {
+			out = out[:120]
+		}
+		return fmt.Errorf("restart helper failed")
+	}
+	return nil
+}
+
+// runExec executes argv directly (no shell) with a timeout and output cap.
+func (h *HelperBackend) runExec(ctx context.Context, argv []string) (string, error) {
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	raw, err := cmd.CombinedOutput()
+	if len(raw) > h.cfg.MaxOutput {
+		raw = raw[:h.cfg.MaxOutput]
+	}
+	return string(raw), err
 }

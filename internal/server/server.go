@@ -197,6 +197,10 @@ func (s *Server) HandleRestart(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, restart.ErrCooldown):
 		w.Header().Set("Retry-After", "10")
 		http.Error(w, "restart cooldown active", http.StatusTooManyRequests)
+	case errors.Is(err, restart.ErrUnavailable):
+		http.Error(w, "restart unavailable (no helper configured)", http.StatusServiceUnavailable)
+	case errors.Is(err, restart.ErrHelperUnavailable):
+		http.Error(w, "restart helper unavailable", http.StatusServiceUnavailable)
 	case err != nil:
 		http.Error(w, "restart failed", http.StatusInternalServerError)
 	default:

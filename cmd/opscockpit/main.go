@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -57,6 +58,8 @@ func main() {
 		err = cmdServe(os.Args[2:])
 	case "discover":
 		err = cmdDiscover(os.Args[2:])
+	case "restart-helper":
+		err = cmdRestartHelper(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println(version.Info())
 		return
@@ -195,6 +198,125 @@ func cmdDiscover(args []string) error {
 	return nil
 }
 
+// cmdRestartHelper is the root-only restart executor invoked by serve via
+// `sudo -n opscockpit restart-helper --services <path> <id>`. It is the SECOND
+// trust boundary: it re-reads the root-owned services.yaml, re-checks
+// restart_enabled, and resolves the exact unit/container itself. Nothing from
+// the web/state.json is trusted.
+func cmdRestartHelper(args []string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("restart-helper must run as root (euid=0)")
+	}
+	fs := flag.NewFlagSet("restart-helper", flag.ExitOnError)
+	servicesPath := fs.String("services", "", "root-owned services.yaml path")
+	timeout := fs.Duration("timeout", 20*time.Second, "systemctl/docker restart timeout")
+	triggerCollect := fs.String("trigger-collect", "opscockpit-collect.service",
+		"systemd unit to start for an immediate collect after restart ('' disables)")
+	_ = fs.Parse(args)
+	if *servicesPath == "" {
+		return fmt.Errorf("restart-helper requires --services path")
+	}
+	// Exactly one positional service id.
+	if fs.NArg() != 1 {
+		return fmt.Errorf("restart-helper requires exactly one service id")
+	}
+	id := fs.Arg(0)
+
+	// Second trust boundary: re-read the root-owned registry and resolve the
+	// exact unit/container. Nothing from state.json or the web is trusted.
+	kind, target, err := resolveRestartTarget(*servicesPath, id)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	switch kind {
+	case "unit":
+		if err := runHelperCmd(ctx, "systemctl", "restart", target); err != nil {
+			return fmt.Errorf("systemctl restart %s: %w", target, err)
+		}
+	case "container":
+		if err := runHelperCmd(ctx, "docker", "restart", target); err != nil {
+			return fmt.Errorf("docker restart %s: %w", target, err)
+		}
+	default:
+		return fmt.Errorf("service %q has no restart target", id)
+	}
+
+	// Optional immediate collect trigger (fixed unit name, not user-supplied).
+	if *triggerCollect != "" {
+		_ = runHelperCmd(ctx, "systemctl", "start", *triggerCollect)
+	}
+	return nil
+}
+
+// resolveRestartTarget re-reads the root-owned registry and returns the exact
+// restart target for a service id (unit or container). It is the SECOND trust
+// boundary: nothing from state.json or the web is trusted. Returns ("unit", u)
+// or ("container", c); ("", "") when the service has no restart target.
+//
+// The services file must be root-owned and not writable by non-root users;
+// otherwise a non-root caller could point the helper at a file that grants an
+// arbitrary unit/container and escalate to restarting any service.
+func resolveRestartTarget(servicesPath, id string) (kind, target string, err error) {
+	if !restart.ServiceIDPattern.MatchString(id) {
+		return "", "", fmt.Errorf("invalid service id")
+	}
+	if err := requireRootOwned(servicesPath); err != nil {
+		return "", "", err
+	}
+	cfg, err := svc.Load(servicesPath)
+	if err != nil {
+		return "", "", fmt.Errorf("load services config: %w", err)
+	}
+	s := cfg.ByID(id)
+	if s == nil {
+		return "", "", fmt.Errorf("unknown service %q", id)
+	}
+	if !s.RestartEnabled {
+		return "", "", fmt.Errorf("restart disabled for service %q", id)
+	}
+	if s.Unit() != "" {
+		return "unit", s.Unit(), nil
+	}
+	if s.DockerContainer() != "" {
+		return "container", s.DockerContainer(), nil
+	}
+	return "", "", fmt.Errorf("service %q has no restart target (no systemd unit or docker container)", id)
+}
+
+// requireRootOwned rejects a services.yaml that a non-root user could have
+// written (world-writable, or owned by a non-root uid) — the second boundary
+// is only trustworthy when the registry itself is root-protected.
+func requireRootOwned(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat services config: %w", err)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("services config %s is group/world-writable; refusing", path)
+	}
+	return nil
+}
+
+// runHelperCmd executes an argv vector directly (no shell) with a timeout and
+// capped output. Used only for fixed, allowlisted commands.
+func runHelperCmd(ctx context.Context, name string, args ...string) error {
+	argv := append([]string{name}, args...)
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	raw, err := cmd.CombinedOutput()
+	if len(raw) > 4096 {
+		raw = raw[:4096]
+	}
+	if err != nil {
+		// Never leak command output (may contain sensitive context).
+		return err
+	}
+	return nil
+}
+
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	statePath := fs.String("state", "state.json", "path to state.json")
@@ -202,6 +324,9 @@ func cmdServe(args []string) error {
 	unixPath := fs.String("unix", "", "unix socket path (preferred for production; empty = TCP)")
 	socketMode := fs.Uint("unix-mode", 0o660, "unix socket file mode (octal)")
 	cooldown := fs.Duration("restart-cooldown", 10*time.Second, "min interval between restarts of the same service")
+	restartHelper := fs.String("restart-helper", "", "root helper binary invoked via sudo (e.g. /usr/local/bin/opscockpit)")
+	restartServices := fs.String("restart-services", "", "root-owned services.yaml the helper re-reads (second allowlist boundary)")
+	restartSudo := fs.Bool("restart-sudo", true, "invoke the helper via sudo -n (production); false for dev")
 	_ = fs.Parse(args)
 
 	// Serve reads ONLY state.json for the restart allowlist — never the
@@ -209,11 +334,28 @@ func cmdServe(args []string) error {
 	// the root collector; serve never parses systemd/Docker/firewall.
 	var broker *restart.Broker
 	store := server.FileStore{Path: *statePath}
+	allowlist := []restart.Entry{}
 	if st, _, err := store.LoadState(); err == nil {
-		broker = restart.NewBrokerCooldown(restart.EntriesFromStateServices(st.Services), restart.NewMock(), *cooldown)
+		allowlist = restart.EntriesFromStateServices(st.Services)
 	} else {
 		fmt.Fprintf(os.Stderr, "warning: could not load %s for restart allowlist: %v\n", *statePath, err)
-		broker = restart.NewBroker(nil, restart.NewMock())
+	}
+
+	if *restartServices == "" {
+		// No helper configured: the restart API must return an explicit
+		// "unavailable", never silently succeed via a mock.
+		fmt.Fprintln(os.Stderr, "warning: restart API disabled — set -restart-services (and -restart-helper) to enable")
+		broker = restart.NewBrokerCooldown(allowlist, restart.NewUnavailableBackend(), *cooldown)
+	} else {
+		backend, berr := restart.NewHelperBackend(restart.HelperConfig{
+			Helper:       *restartHelper,
+			ServicesPath: *restartServices,
+			Sudo:         *restartSudo,
+		})
+		if berr != nil {
+			return berr
+		}
+		broker = restart.NewBrokerCooldown(allowlist, backend, *cooldown)
 	}
 
 	srv := server.New(

@@ -1,0 +1,25 @@
+# OpsCockpit restart helper — sudoers template (REFERENCE ONLY).
+#
+# Installed during the deployment phase (NOT by this repository or CI):
+#   install -m 0440 deploy/templates/sudoers.d-opscockpit /etc/sudoers.d/opscockpit
+#   visudo -cf /etc/sudoers.d/opscockpit
+#
+# Purpose: let the non-root OpsCockpit web user run ONLY the fixed
+# restart-helper with a fixed services.yaml path. The helper itself validates
+# the service id and re-reads the root-owned registry (second allowlist
+# boundary). The web user can never run arbitrary systemctl, docker, bash, sh,
+# or any command — only this exact helper invocation.
+
+# Replace `opsweb` with the actual web service account (decided at deploy time;
+# OpsCockpit does not guess a username).
+opsweb ALL=(root) NOPASSWD: /usr/local/bin/opscockpit restart-helper --services /etc/opscockpit/services.yaml *
+
+# The `*` matches ONLY the single trailing service-id argument. It is not a
+# wildcard for arbitrary commands: sudoers applies this rule only to the
+# literal binary + fixed subcommand + fixed flag value. The service id is
+# re-validated by the helper's ServiceIDPattern before anything runs.
+
+# Explicitly denied — nothing else is permitted:
+# opsweb ALL=(root) NOPASSWD: /bin/systemctl          # NOT granted
+# opsweb ALL=(root) NOPASSWD: /usr/bin/docker         # NOT granted
+# opsweb ALL=(root) NOPASSWD: /bin/sh, /bin/bash      # NOT granted

@@ -28,8 +28,10 @@ func TestRestartKnownService(t *testing.T) {
 	if err := b.Restart(context.Background(), "hysteria2"); err != nil {
 		t.Fatal(err)
 	}
+	// The broker hands the backend the service id; the root helper resolves
+	// the exact unit from root-owned services.yaml (second boundary).
 	got := mock.Restarts()
-	if !reflect.DeepEqual(got, []string{"hysteria-server.service"}) {
+	if !reflect.DeepEqual(got, []string{"hysteria2"}) {
 		t.Fatalf("restarts = %v", got)
 	}
 }
@@ -76,15 +78,22 @@ func TestRestartMaliciousID(t *testing.T) {
 	}
 }
 
-func TestRestartInjectionTargetsOnlyAllowlistedUnit(t *testing.T) {
-	// Even if the backend were tricked, the unit string handed to it is the
-	// allowlist's. Prove no client string can reach the backend by simulating
-	// an adversarial id.
+func TestRestartBackendReceivesOnlyServiceID(t *testing.T) {
+	// The backend must only ever receive the validated service id — never a
+	// unit name, container name, or anything client-influenced. The root
+	// helper resolves the exact unit/container from root-owned services.yaml.
 	b, mock := testBroker(t)
-	_ = b.Restart(context.Background(), "hysteria2")
-	for _, unit := range mock.Restarts() {
-		if !strings.HasSuffix(unit, ".service") || strings.ContainsAny(unit, ";&|$`") {
-			t.Errorf("backend received untrusted unit %q", unit)
+	for _, id := range []string{"hysteria2", "nginx"} {
+		if err := b.Restart(context.Background(), id); err != nil {
+			t.Fatalf("restart %s: %v", id, err)
+		}
+	}
+	for _, got := range mock.Restarts() {
+		if !ServiceIDPattern.MatchString(got) {
+			t.Errorf("backend received non-service-id %q", got)
+		}
+		if strings.ContainsAny(got, ".;&|$` /\\\n") {
+			t.Errorf("backend received suspicious value %q", got)
 		}
 	}
 }
