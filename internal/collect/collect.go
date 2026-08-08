@@ -562,23 +562,43 @@ func (rd runnerDocker) ListFromPS(ps string) []dockerContainerHealth {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "|", 5)
+		// Format: ID|Names|Image|Status  (no health column — parsed from Status).
+		parts := strings.SplitN(line, "|", 4)
 		if len(parts) < 4 {
 			continue
 		}
 		name := strings.TrimSpace(parts[1])
 		status := strings.TrimSpace(parts[3])
-		health := ""
-		if len(parts) >= 5 {
-			health = strings.TrimSpace(parts[4])
-		}
 		out = append(out, dockerContainerHealth{
 			Name:    name,
 			Running: strings.HasPrefix(status, "Up "),
-			Health:  health,
+			Health:  dockerHealthFromStatus(status),
 		})
 	}
 	return out
+}
+
+// dockerHealthFromStatus parses the Docker health indicator out of a Status
+// string. Common formats:
+//
+//	Up 2 hours
+//	Up 2 hours (healthy)
+//	Up 2 hours (unhealthy)
+//	Up 2 hours (health: starting)
+//
+// A running container with no health marker has no HEALTHCHECK → health ""
+// (not a warning). Parsing is conservative; unknown markers → "".
+func dockerHealthFromStatus(status string) string {
+	if strings.Contains(status, "(healthy)") {
+		return "healthy"
+	}
+	if strings.Contains(status, "(unhealthy)") {
+		return "unhealthy"
+	}
+	if strings.Contains(status, "(health: starting)") || strings.Contains(status, "(starting)") {
+		return "starting"
+	}
+	return ""
 }
 
 // collectDeclaredUpstreams resolves services.yaml topology.upstream_from

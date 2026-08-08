@@ -17,7 +17,7 @@ func TestDockerServiceHealth(t *testing.T) {
       container: my-app
 `)
 	r := &mockRunner{
-		dockerPS: `abc123|my-app|img/app:1|Up 2 hours|healthy
+		dockerPS: `abc123|my-app|img/app:1|Up 2 hours (healthy)
 def456|other|img/x|Exited (0) 1 hour ago|
 `,
 	}
@@ -41,7 +41,7 @@ func TestDockerUnhealthyWarns(t *testing.T) {
       container: my-app
 `)
 	r := &mockRunner{
-		dockerPS: `abc123|my-app|img/app:1|Up 2 hours (unhealthy)|unhealthy
+		dockerPS: `abc123|my-app|img/app:1|Up 2 hours (unhealthy)
 `,
 	}
 	res, err := Collect(context.Background(), r, Options{ServicesPath: svcPath})
@@ -89,7 +89,7 @@ func TestDockerLoopbackPublishedPortNeverTopLevel(t *testing.T) {
 		// ss has nothing public; the only "listener" is the loopback docker
 		// published port (not in ss). Docker publish is loopback → internal.
 		ssText:  "",
-		dockerPS: `abc123|my-app|img/app:1|Up 2 hours|healthy
+		dockerPS: `abc123|my-app|img/app:1|Up 2 hours (healthy)
 `,
 		ufwText: `Status: active
 Default: deny (incoming), allow (outgoing), disabled (routed)

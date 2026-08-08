@@ -125,4 +125,14 @@ describe('validateState', () => {
     expect(() => validateState({ schema_version: 1 })).toThrow(SchemaError)
     expect(() => validateState('garbage')).toThrow(SchemaError)
   })
+
+  it('rejects topology.edges null (must be an array)', () => {
+    const bad = { ...good, topology: { nodes: [], edges: null } }
+    expect(() => validateState(bad)).toThrow(SchemaError)
+  })
+
+  it('rejects topology.nodes null', () => {
+    const bad = { ...good, topology: { nodes: null, edges: [] } }
+    expect(() => validateState(bad)).toThrow(SchemaError)
+  })
 })

@@ -22,7 +22,13 @@ type Source struct {
 // FromDir builds a Source rooted at dir (for tests).
 func FromDir(dir string) Source { return Source{Root: dir} }
 
-func (s Source) path(rel string) string { return filepath.Join(s.Root, rel) }
+func (s Source) path(rel string) string {
+	root := s.Root
+	if root == "" {
+		root = "/"
+	}
+	return filepath.Join(root, rel)
+}
 
 func (s Source) readFile(rel string) (string, error) {
 	b, err := os.ReadFile(s.path(rel))

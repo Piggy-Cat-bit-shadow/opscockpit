@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -100,40 +99,16 @@ func cmdCollect(args []string) error {
 	ctx := context.Background()
 	pr := collect.NewProductionRunner()
 
-	hs := host.Source{}
-	cs := cgroup.Source{}
-	if *fixtureRoot != "" {
-		hs = host.FromDir(*fixtureRoot)
-		cs = cgroup.FromDir(*fixtureRoot)
-		// Fixture mode: map PIDs to services. First from cgroup.procs (master
-		// PIDs), then via /proc/<pid>/cgroup so worker PIDs resolve too.
-		pidSvc := map[int]string{}
-		unitSvc := map[string]string{}
-		if cfg, err := svc.Load(*servicesPath); err == nil {
-			for _, s := range cfg.Services {
-				unit := s.Unit()
-				if unit == "" {
-					continue
-				}
-				unitSvc[unit] = s.ID
-				rel := "sys/fs/cgroup/system.slice/" + unit
-				pids, err := os.ReadFile(filepath.Join(*fixtureRoot, rel, "cgroup.procs"))
-				if err != nil {
-					continue
-				}
-				for _, line := range strings.Split(string(pids), "\n") {
-					line = strings.TrimSpace(line)
-					if line == "" {
-						continue
-					}
-					if pid, err := strconv.Atoi(line); err == nil {
-						pidSvc[pid] = s.ID
-					}
-				}
-			}
-		}
-		pr.SetPIDResolver(collect.BuildPIDResolver(pidSvc, collect.ProcCgroup{Root: *fixtureRoot}, unitSvc))
-	}
+	// Always wire the PID → service resolver, in BOTH production and fixture
+	// mode. Production runtimeRoot is "" → effectiveRoot "/" → /proc/<pid>/cgroup
+	// and /sys/fs/cgroup/... resolve against the real host. The resolver maps
+	// PID → cgroup → systemd unit → service id (worker PIDs included).
+	runtimeRoot := *fixtureRoot
+	unitSvc, pidSvc := collect.LoadUnitServiceMapping(*servicesPath, runtimeRoot)
+	pr.SetPIDResolver(collect.BuildPIDResolver(pidSvc, collect.ProcCgroup{Root: runtimeRoot}, unitSvc))
+
+	hs := host.FromDir(runtimeRoot)
+	cs := cgroup.FromDir(runtimeRoot)
 
 	res, err := collect.Collect(ctx, pr, collect.Options{
 		HostSource:    hs,

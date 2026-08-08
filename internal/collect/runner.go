@@ -8,8 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	svc "github.com/opscockpit/opscockpit/internal/collector/config"
 )
 
 // ProductionRunner executes real commands. It is the production counterpart of
@@ -192,14 +195,18 @@ func (r *ProductionRunner) NginxT(ctx context.Context) (string, error) {
 
 // DockerPS runs a docker ps listing. When OPSCOCKPIT_DOCKER_PS is set (fixture
 // mode), it reads from that file instead. Docker is optional: errors return ""
-// + err and never fail a collect. The format includes the health status column.
+// + err and never fail a collect.
+//
+// The format deliberately avoids {{.Health}} — not all Docker Engine versions
+// support that template field. Container health is parsed from the Status
+// string (e.g. "Up ... (healthy)", "(unhealthy)", "(health: starting)").
 func (r *ProductionRunner) DockerPS(ctx context.Context) (string, error) {
 	if f := os.Getenv("OPSCOCKPIT_DOCKER_PS"); f != "" {
 		b, err := os.ReadFile(f)
 		return string(b), err
 	}
 	return r.runBounded(ctx, []string{"docker", "ps", "-a", "--no-trunc",
-		"--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Health}}"}, 8*time.Second)
+		"--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}"}, 8*time.Second)
 }
 
 // ResolveServiceID implements the collect hook.
@@ -226,7 +233,11 @@ type ProcCgroup struct {
 // CgroupPath reads /proc/<pid>/cgroup and returns the first path line.
 func (p ProcCgroup) CgroupPath(pid int) string {
 	rel := fmt.Sprintf("proc/%d/cgroup", pid)
-	b, err := os.ReadFile(filepath.Join(p.Root, rel))
+	root := p.Root
+	if root == "" {
+		root = "/"
+	}
+	b, err := os.ReadFile(filepath.Join(root, rel))
 	if err != nil {
 		return ""
 	}
@@ -286,4 +297,45 @@ func BuildPIDResolver(pidToSvc map[int]string, proc ProcCgroupReader, unitToSvc 
 		}
 		return unitToSvc[unit]
 	}
+}
+
+// LoadUnitServiceMapping reads services.yaml and builds:
+//   - unitToSvc: systemd unit name → service id
+//   - pidToSvc: PID → service id (from cgroup.procs under the runtime root)
+//
+// runtimeRoot is the pretend "/" — "" means the real host (effective "/"),
+// a fixture path uses <fixture>/sys/fs/cgroup/....
+func LoadUnitServiceMapping(servicesPath, runtimeRoot string) (unitToSvc map[string]string, pidToSvc map[int]string) {
+	unitToSvc = map[string]string{}
+	pidToSvc = map[int]string{}
+	cfg, err := svc.Load(servicesPath)
+	if err != nil {
+		return unitToSvc, pidToSvc
+	}
+	root := runtimeRoot
+	if root == "" {
+		root = "/"
+	}
+	for _, s := range cfg.Services {
+		unit := s.Unit()
+		if unit == "" {
+			continue
+		}
+		unitToSvc[unit] = s.ID
+		rel := filepath.Join("sys/fs/cgroup/system.slice", unit, "cgroup.procs")
+		pids, err := os.ReadFile(filepath.Join(root, rel))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(pids), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if pid, err := strconv.Atoi(line); err == nil {
+				pidToSvc[pid] = s.ID
+			}
+		}
+	}
+	return unitToSvc, pidToSvc
 }

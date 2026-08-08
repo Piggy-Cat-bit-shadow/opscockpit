@@ -121,7 +121,8 @@ func depInstanceID(serviceID, proto string, port int) string {
 
 // Generate produces the deterministic port tree.
 func Generate(in Input, opts Options) (state.Topology, error) {
-	t := state.Topology{}
+	// Nodes/Edges must marshal to [] not null even when empty.
+	t := state.Topology{Nodes: []state.Node{}, Edges: []state.Edge{}}
 	maxNodes := opts.MaxNodes
 	if maxNodes <= 0 {
 		maxNodes = defaultMaxNodes

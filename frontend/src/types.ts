@@ -261,7 +261,7 @@ export function validateState(payload: unknown): State {
   if (s.schema_version !== SCHEMA_VERSION) {
     throw new SchemaError('schema', `Unsupported schema version ${s.schema_version} (expected ${SCHEMA_VERSION})`)
   }
-  if (!s.host || !Array.isArray(s.services) || !s.health || !s.topology || !Array.isArray(s.topology.nodes)) {
+  if (!s.host || !Array.isArray(s.services) || !s.health || !s.topology || !Array.isArray(s.topology.nodes) || !Array.isArray(s.topology.edges)) {
     throw new SchemaError('malformed', 'State is missing required sections')
   }
   return s as State

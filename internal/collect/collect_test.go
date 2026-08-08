@@ -31,6 +31,7 @@ type mockRunner struct {
 	nginxText  string
 	dockerPS   string
 	unitExecStart map[string]string // unit → ExecStart override
+	resolveFn     func(pid int) string // production-style PID resolver override
 	pidCgroups map[int]string // pid → cgroup path (worker mapping)
 }
 
@@ -126,7 +127,12 @@ func (m *mockRunner) Version(ctx context.Context, argv []string) (string, error)
 	return "", nil
 }
 
-func (m *mockRunner) ResolveServiceID(pid int) string { return m.pidToSvc[pid] }
+func (m *mockRunner) ResolveServiceID(pid int) string {
+	if m.resolveFn != nil {
+		return m.resolveFn(pid)
+	}
+	return m.pidToSvc[pid]
+}
 
 // ssFixtureText matches the spec's testdata environment.
 const ssFixtureText = `tcp   LISTEN 0 511    0.0.0.0:443       0.0.0.0:*  users:(("nginx",pid=1001,fd=10))

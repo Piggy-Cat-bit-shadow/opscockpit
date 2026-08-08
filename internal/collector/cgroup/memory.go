@@ -26,7 +26,13 @@ type Source struct {
 // FromDir builds a Source rooted at dir.
 func FromDir(dir string) Source { return Source{Root: dir} }
 
-func (s Source) path(rel string) string { return filepath.Join(s.Root, rel) }
+func (s Source) path(rel string) string {
+	root := s.Root
+	if root == "" {
+		root = "/"
+	}
+	return filepath.Join(root, rel)
+}
 
 // Result is a memory readout.
 type Result struct {
