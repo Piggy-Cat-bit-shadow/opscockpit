@@ -51,6 +51,8 @@ fi
 echo "==> collect (mode: $MODE)…"
 OPSCOCKPIT_SS_FILE="$WORK/ss.txt" \
 OPSCOCKPIT_UNIT_DIR="$ROOT/testdata/systemd" \
+OPSCOCKPIT_UFW_FILE="$ROOT/testdata/ufw-status.txt" \
+OPSCOCKPIT_NAT_FILE="$ROOT/testdata/iptables-nat.txt" \
   "$BUILD_DIR/opscockpit" collect \
   -services "$ROOT/configs/services.example.yaml" \
   -out "$WORK/state.json" \

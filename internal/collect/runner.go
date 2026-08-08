@@ -119,6 +119,30 @@ func (r *ProductionRunner) Version(ctx context.Context, argv []string) (string, 
 	return string(out), err
 }
 
+// UFWStatus runs `LC_ALL=C ufw status verbose`. When OPSCOCKPIT_UFW_FILE is
+// set (fixture mode), it reads from that file instead.
+func (r *ProductionRunner) UFWStatus(ctx context.Context) (string, error) {
+	if f := os.Getenv("OPSCOCKPIT_UFW_FILE"); f != "" {
+		b, err := os.ReadFile(f)
+		return string(b), err
+	}
+	cmd := exec.CommandContext(ctx, "env", "LC_ALL=C", "ufw", "status", "verbose")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// IptablesNat runs `iptables -t nat -S`. When OPSCOCKPIT_NAT_FILE is set
+// (fixture mode), it reads from that file instead.
+func (r *ProductionRunner) IptablesNat(ctx context.Context) (string, error) {
+	if f := os.Getenv("OPSCOCKPIT_NAT_FILE"); f != "" {
+		b, err := os.ReadFile(f)
+		return string(b), err
+	}
+	cmd := exec.CommandContext(ctx, "iptables", "-t", "nat", "-S")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // ResolveServiceID implements the collect hook.
 func (r *ProductionRunner) ResolveServiceID(pid int) string {
 	if r.resolvePID == nil {

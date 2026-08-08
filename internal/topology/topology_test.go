@@ -22,14 +22,15 @@ func mockServices() []svc.Service {
 
 // mockListeners models the spec testdata: 443/TCP nginx, 443/UDP hysteria2,
 // 8443/UDP tuic, 853/TCP+UDP adguard, and internal 127.0.0.1:18444 xray.
+// Exposure is pre-classified (the collect layer does this from firewall+NAT).
 func mockListeners() []Listener {
 	return []Listener{
-		{ServiceID: "nginx", Protocol: "tcp", Port: 443, Address: "0.0.0.0"},
-		{ServiceID: "hysteria2", Protocol: "udp", Port: 443, Address: "::"},
-		{ServiceID: "tuic", Protocol: "udp", Port: 8443, Address: "::"},
-		{ServiceID: "adguard-home", Protocol: "tcp", Port: 853, Address: "0.0.0.0"},
-		{ServiceID: "adguard-home", Protocol: "udp", Port: 853, Address: "0.0.0.0"},
-		{ServiceID: "xray", Protocol: "tcp", Port: 18444, Address: "127.0.0.1", Internal: true},
+		{ServiceID: "nginx", Protocol: "tcp", Port: 443, Address: "0.0.0.0", Exposure: state.ExposureDirectPublic},
+		{ServiceID: "hysteria2", Protocol: "udp", Port: 443, Address: "::", Exposure: state.ExposureDirectPublic},
+		{ServiceID: "tuic", Protocol: "udp", Port: 8443, Address: "::", Exposure: state.ExposureDirectPublic},
+		{ServiceID: "adguard-home", Protocol: "tcp", Port: 853, Address: "0.0.0.0", Exposure: state.ExposureDirectPublic},
+		{ServiceID: "adguard-home", Protocol: "udp", Port: 853, Address: "0.0.0.0", Exposure: state.ExposureDirectPublic},
+		{ServiceID: "xray", Protocol: "tcp", Port: 18444, Address: "127.0.0.1", Internal: true, Exposure: state.ExposureInternal},
 	}
 }
 
@@ -131,7 +132,7 @@ func TestRuntimeChange(t *testing.T) {
 	a := Input{
 		Services: services,
 		Listeners: []Listener{
-			{ServiceID: "hysteria2", Protocol: "udp", Port: 443, Address: "::"},
+			{ServiceID: "hysteria2", Protocol: "udp", Port: 443, Address: "::", Exposure: state.ExposureDirectPublic},
 		},
 	}
 	ta, _ := Generate(a, Options{IncludeInternetRoot: true})
@@ -140,7 +141,7 @@ func TestRuntimeChange(t *testing.T) {
 	b := Input{
 		Services: services,
 		Listeners: []Listener{
-			{ServiceID: "hysteria2", Protocol: "udp", Port: 9443, Address: "::"},
+			{ServiceID: "hysteria2", Protocol: "udp", Port: 9443, Address: "::", Exposure: state.ExposureDirectPublic},
 		},
 	}
 	tb, _ := Generate(b, Options{IncludeInternetRoot: true})
@@ -202,8 +203,8 @@ func TestDuplicateProtocolServicePair(t *testing.T) {
 	in := Input{
 		Services: []svc.Service{{ID: "nginx", Name: "Nginx", StatusHint: state.StatusHealthy}},
 		Listeners: []Listener{
-			{ServiceID: "nginx", Protocol: "tcp", Port: 443, Address: "0.0.0.0"},
-			{ServiceID: "nginx", Protocol: "tcp", Port: 443, Address: "::"},
+			{ServiceID: "nginx", Protocol: "tcp", Port: 443, Address: "0.0.0.0", Exposure: state.ExposureDirectPublic},
+			{ServiceID: "nginx", Protocol: "tcp", Port: 443, Address: "::", Exposure: state.ExposureDirectPublic},
 		},
 	}
 	tp, _ := Generate(in, Options{IncludeInternetRoot: true})

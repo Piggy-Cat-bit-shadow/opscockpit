@@ -70,6 +70,10 @@ export interface TopoNode extends Record<string, unknown> {
   service_id?: string
   protocol?: string
   port?: number
+  port_start?: number
+  port_end?: number
+  target_port?: number
+  exposure?: string
   status?: Status
 }
 
@@ -158,6 +162,10 @@ export function sortServices(services: Service[]): Service[] {
 /** Build a collapsible tree from the flat topology for the mobile view. */
 export interface TreePort {
   port: number
+  portStart: number
+  portEnd: number
+  /** Rendered label: single port or "start–end". */
+  label: string
   protocols: TreeProtocol[]
 }
 
@@ -173,32 +181,45 @@ export interface TreeService {
   instanceId: string
 }
 
+/** Format a port range: single port when start==end, else "start–end". */
+export function formatPortRange(start: number, end: number): string {
+  if (start === end) return `${start}`
+  return `${start}–${end}`
+}
+
 export function buildPortTree(topology: Topology): TreePort[] {
-  const ports = new Map<number, TreePort>()
+  const ports = new Map<string, TreePort>()
 
   for (const node of topology.nodes) {
-    if (node.type === 'service' && node.port != null) {
-      let port = ports.get(node.port)
-      if (!port) {
-        port = { port: node.port, protocols: [] }
-        ports.set(node.port, port)
-      }
-      const proto = (node.protocol === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp'
-      let tp = port.protocols.find((p) => p.protocol === proto)
-      if (!tp) {
-        tp = { protocol: proto, services: [] }
-        port.protocols.push(tp)
-      }
-      tp.services.push({
-        serviceId: node.service_id ?? node.id,
-        name: node.label,
-        status: node.status,
-        instanceId: node.id,
-      })
+    if (node.type !== 'service') continue
+    // Service nodes carry the backend port; the enclosing port/protocol nodes
+    // carry the range. Key the tree on the parent port node's range.
+    const startRaw = node.port_start ?? node.port
+    if (startRaw == null) continue
+    const start: number = startRaw
+    const end: number = node.port_end ?? start
+
+    const key = `${start}:${end}`
+    let port = ports.get(key)
+    if (!port) {
+      port = { port: start, portStart: start, portEnd: end, label: formatPortRange(start, end), protocols: [] }
+      ports.set(key, port)
     }
+    const proto = (node.protocol === 'udp' ? 'udp' : 'tcp') as 'tcp' | 'udp'
+    let tp = port.protocols.find((p) => p.protocol === proto)
+    if (!tp) {
+      tp = { protocol: proto, services: [] }
+      port.protocols.push(tp)
+    }
+    tp.services.push({
+      serviceId: node.service_id ?? node.id,
+      name: node.label,
+      status: node.status,
+      instanceId: node.id,
+    })
   }
 
-  const tree = [...ports.values()].sort((a, b) => a.port - b.port)
+  const tree = [...ports.values()].sort((a, b) => a.portStart - b.portStart || a.portEnd - b.portEnd)
   for (const p of tree) {
     p.protocols.sort((a, b) => (a.protocol === b.protocol ? 0 : a.protocol === 'tcp' ? -1 : 1))
     for (const pr of p.protocols) {

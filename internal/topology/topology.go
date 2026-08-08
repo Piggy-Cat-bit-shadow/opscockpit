@@ -1,19 +1,25 @@
-// Package topology builds the data-driven port tree from runtime listeners and
-// service registry entries.
+// Package topology builds the data-driven port tree from runtime listeners,
+// firewall/NAT exposure evidence, and the service registry.
 //
 // The generator is pure and deterministic: given the same runtime + services,
 // it always produces the same nodes and edges in the same order. The frontend
 // knows nothing about individual services — it only renders PortNode,
 // ProtocolNode and ServiceNode from this data.
 //
-// Tree shape:
+// Exposure is NOT decided here: the collect layer classifies each listener
+// (direct_public, nat_ingress, internal, unknown) using firewall + NAT +
+// services.yaml override. This package only renders what it is told.
 //
-//	Internet
-//	  └─ Port 443
-//	       ├─ TCP → Nginx → (Xray, via internal dependency)
-//	       └─ UDP → Hysteria2
+// Two shapes can appear:
 //
-// Internal listeners (loopback) never become top-level ports.
+//	Direct public:
+//	  Internet → Port 443 → TCP → Nginx
+//
+//	NAT ingress (firewall allows 20000-20099, REDIRECT → 443, Hysteria listens):
+//	  Internet → Port 20000–20099 → UDP → Hysteria2
+//
+// Internal listeners and NAT-backend targets never become their own top-level
+// port unless the service explicitly forces direct exposure.
 package topology
 
 import (
@@ -23,13 +29,17 @@ import (
 	svc "github.com/opscockpit/opscockpit/internal/collector/config"
 	"github.com/opscockpit/opscockpit/internal/state"
 )
+
 // Input is everything the generator needs. Collectors produce it; tests build
 // it directly.
 type Input struct {
 	// Services in registry order (the config's Services slice).
 	Services []svc.Service
-	// Listeners discovered at runtime (public and internal).
+	// Listeners discovered at runtime, already exposure-classified by the
+	// collect layer.
 	Listeners []Listener
+	// NATIngresses are public NAT redirects, already resolved to a service id.
+	NATIngresses []NATIngress
 	// Dependencies maps a service id to its internal dependencies (other
 	// service ids). Evidence records how the link was found.
 	Dependencies map[string][]Dependency
@@ -44,6 +54,17 @@ type Listener struct {
 	Internal  bool
 	PID       int
 	Process   string
+	// Exposure is the classification assigned by the collect layer.
+	Exposure string
+}
+
+// NATIngress is a public redirect ingress resolved to a registered service.
+type NATIngress struct {
+	Protocol        string
+	PortStart       int
+	PortEnd         int
+	TargetPort      int
+	ServiceID       string
 }
 
 // Dependency is an internal service dependency with evidence.
@@ -53,10 +74,11 @@ type Dependency struct {
 	Confidence      string
 }
 
-// protoSvc binds a protocol+port to a service id.
+// protoSvc binds a protocol to a service id (and the backend port it listens on).
 type protoSvc struct {
 	protocol  string
 	serviceID string
+	backendPort int
 }
 
 // Options tune generation.
@@ -68,13 +90,21 @@ type Options struct {
 // ID schemes (stable across runs).
 const internetID = "internet"
 
-func portNodeID(port int) string { return fmt.Sprintf("port-%d", port) }
-func protocolNodeID(port int, p string) string {
-	return fmt.Sprintf("port-%d-%s", port, p)
+func portNodeID(start, end int) string {
+	if start == end {
+		return fmt.Sprintf("port-%d", start)
+	}
+	return fmt.Sprintf("port-%d-%d", start, end)
 }
-func serviceInstanceID(serviceID, protocol string, port int) string {
-	return fmt.Sprintf("%s@%s:%d", serviceID, protocol, port)
+
+func protocolNodeID(start, end int, p string) string {
+	return fmt.Sprintf("%s-%s", portNodeID(start, end), p)
 }
+
+func serviceInstanceID(serviceID, protocol string, backendPort int) string {
+	return fmt.Sprintf("%s@%s:%d", serviceID, protocol, backendPort)
+}
+
 func depInstanceID(serviceID, proto string, port int) string {
 	return fmt.Sprintf("%s@dep:%s:%d", serviceID, proto, port)
 }
@@ -88,43 +118,69 @@ func Generate(in Input, opts Options) (state.Topology, error) {
 		byID[s.ID] = s
 	}
 
-	// Public ports → protocol/service pairs. Internal listeners are excluded
-	// entirely: a loopback port can never be a top-level Internet port.
+	// ---- Group 1: direct-public listeners → top-level port tree.
 	type portGroup struct {
-		port   int
+		start  int
+		end    int
 		protos []protoSvc
 	}
 	var groups []portGroup
-	seenPorts := map[int]bool{}
+	groupKey := map[string]int{} // "start:end" → index
+
+	addProto := func(groups []portGroup, key string, start, end int, ps protoSvc) []portGroup {
+		if idx, ok := groupKey[key]; ok {
+			groups[idx].protos = append(groups[idx].protos, ps)
+			return groups
+		}
+		groupKey[key] = len(groups)
+		groups = append(groups, portGroup{start: start, end: end, protos: []protoSvc{ps}})
+		return groups
+	}
 
 	for _, l := range in.Listeners {
-		if l.Internal || l.Port <= 0 || l.Port > 65535 {
+		if l.Exposure != state.ExposureDirectPublic {
+			continue // nat targets, internal, unknown, filtered → not top-level
+		}
+		if l.Port <= 0 || l.Port > 65535 {
 			continue
 		}
 		if _, exists := byID[l.ServiceID]; !exists {
 			continue
 		}
-		if !seenPorts[l.Port] {
-			seenPorts[l.Port] = true
-			groups = append(groups, portGroup{port: l.Port})
-		}
-	}
-	for i := range groups {
-		for _, l := range in.Listeners {
-			if l.Internal || l.Port != groups[i].port {
-				continue
-			}
-			if _, exists := byID[l.ServiceID]; !exists {
-				continue
-			}
-			groups[i].protos = append(groups[i].protos, protoSvc{protocol: l.Protocol, serviceID: l.ServiceID})
-		}
-		groups[i].protos = dedupProtos(groups[i].protos)
+		key := fmt.Sprintf("%d:%d", l.Port, l.Port)
+		groups = addProto(groups, key, l.Port, l.Port, protoSvc{protocol: l.Protocol, serviceID: l.ServiceID, backendPort: l.Port})
 	}
 
-	// Deterministic ordering: port ascending, then TCP before UDP, then
-	// service id.
-	sort.SliceStable(groups, func(i, j int) bool { return groups[i].port < groups[j].port })
+	// ---- Group 2: NAT ingresses → top-level port/range tree.
+	for _, ing := range in.NATIngresses {
+		if ing.PortStart <= 0 || ing.PortStart > 65535 {
+			continue
+		}
+		if ing.PortEnd < ing.PortStart {
+			ing.PortEnd = ing.PortStart
+		}
+		if _, exists := byID[ing.ServiceID]; !exists {
+			continue
+		}
+		key := fmt.Sprintf("%d:%d", ing.PortStart, ing.PortEnd)
+		groups = addProto(groups, key, ing.PortStart, ing.PortEnd, protoSvc{
+			protocol:    ing.Protocol,
+			serviceID:   ing.ServiceID,
+			backendPort: ing.TargetPort,
+		})
+	}
+
+	// Deterministic ordering: by (start, end) ascending, then TCP before UDP,
+	// then service id.
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].start != groups[j].start {
+			return groups[i].start < groups[j].start
+		}
+		if groups[i].end != groups[j].end {
+			return groups[i].end < groups[j].end
+		}
+		return false
+	})
 	for i := range groups {
 		sort.SliceStable(groups[i].protos, func(a, b int) bool {
 			if groups[i].protos[a].protocol != groups[i].protos[b].protocol {
@@ -132,6 +188,12 @@ func Generate(in Input, opts Options) (state.Topology, error) {
 			}
 			return groups[i].protos[a].serviceID < groups[i].protos[b].serviceID
 		})
+	}
+
+	// Merge consecutive single-port groups? No — keep explicit (start,end).
+	// Deduplicate identical (start,end,protocol,serviceID,backendPort) pairs.
+	for i := range groups {
+		groups[i].protos = dedupProtos(groups[i].protos)
 	}
 
 	if opts.IncludeInternetRoot {
@@ -142,42 +204,65 @@ func Generate(in Input, opts Options) (state.Topology, error) {
 		})
 	}
 
-	// Dependency instances already emitted per service+proto+port, to avoid
-	// duplicate nodes when the same target is reached twice.
 	emittedDep := map[string]bool{}
 
 	for _, g := range groups {
-		portID := portNodeID(g.port)
-		t.Nodes = append(t.Nodes, state.Node{
-			ID:    portID,
-			Type:  state.NodePort,
-			Label: fmt.Sprintf("%d", g.port),
-			Port:  g.port,
-		})
+		pid := portNodeID(g.start, g.end)
+		label := state.PortLabel(g.start, g.end)
+
+		// Determine exposure + target for this port group (from NAT ingress if
+		// this is a range, else from direct listener).
+		exposure := state.ExposureDirectPublic
+		var targetPort int
+		if g.start != g.end {
+			exposure = state.ExposureNATIngress
+			// Find the NAT ingress for this range to attach the target port.
+			for _, ing := range in.NATIngresses {
+				if ing.PortStart == g.start && ing.PortEnd == g.end {
+					targetPort = ing.TargetPort
+					break
+				}
+			}
+		}
+
+		portNode := state.Node{
+			ID:         pid,
+			Type:       state.NodePort,
+			Label:      label,
+			PortStart:  g.start,
+			PortEnd:    g.end,
+			Port:       g.start,
+			Exposure:   exposure,
+			TargetPort: targetPort,
+		}
+		t.Nodes = append(t.Nodes, portNode)
 		if opts.IncludeInternetRoot {
+			evidence := &state.Evidence{Source: state.EvidenceFirewall, Confidence: state.ConfidenceConfirmed}
+			if g.start != g.end {
+				evidence = &state.Evidence{Source: state.EvidenceIptablesRedirect, Confidence: state.ConfidenceConfirmed}
+			}
 			t.Edges = append(t.Edges, state.Edge{
-				ID:     fmt.Sprintf("e-%s-%s", internetID, portID),
+				ID:     fmt.Sprintf("e-%s-%s", internetID, pid),
 				Source: internetID,
-				Target: portID,
-				Evidence: &state.Evidence{
-					Source:     state.EvidenceRuntimeListener,
-					Confidence: state.ConfidenceConfirmed,
-				},
+				Target: pid,
+				Evidence: evidence,
 			})
 		}
 
 		for _, ps := range g.protos {
-			pID := protocolNodeID(g.port, ps.protocol)
+			pID := protocolNodeID(g.start, g.end, ps.protocol)
 			t.Nodes = append(t.Nodes, state.Node{
 				ID:       pID,
 				Type:     state.NodeProtocol,
 				Label:    upperProto(ps.protocol),
 				Protocol: ps.protocol,
-				Port:     g.port,
+				Port:     g.start,
+				PortStart: g.start,
+				PortEnd:   g.end,
 			})
 			t.Edges = append(t.Edges, state.Edge{
-				ID:     fmt.Sprintf("e-%s-%s", portID, pID),
-				Source: portID,
+				ID:     fmt.Sprintf("e-%s-%s", pid, pID),
+				Source: pid,
 				Target: pID,
 				Evidence: &state.Evidence{
 					Source:     state.EvidenceRuntimeListener,
@@ -186,14 +271,18 @@ func Generate(in Input, opts Options) (state.Topology, error) {
 			})
 
 			entry := byID[ps.serviceID]
-			instID := serviceInstanceID(ps.serviceID, ps.protocol, g.port)
+			instID := serviceInstanceID(ps.serviceID, ps.protocol, ps.backendPort)
 			t.Nodes = append(t.Nodes, state.Node{
 				ID:        instID,
 				Type:      state.NodeService,
 				Label:     entry.Name,
 				ServiceID: entry.ID,
 				Protocol:  ps.protocol,
-				Port:      g.port,
+				Port:      ps.backendPort,
+				// The ingress range the service is reached on (for a NAT range
+				// this differs from the backend port; the frontend groups by it).
+				PortStart: g.start,
+				PortEnd:   g.end,
 				Status:    normStatus(entry.StatusHint),
 			})
 			t.Edges = append(t.Edges, state.Edge{
@@ -212,7 +301,6 @@ func Generate(in Input, opts Options) (state.Topology, error) {
 				if !exists {
 					continue
 				}
-				// Find a runtime listener instance for the target.
 				dp, dport, found := targetInstance(in, dep.TargetServiceID)
 				if !found {
 					continue
@@ -258,7 +346,7 @@ func dedupProtos(in []protoSvc) []protoSvc {
 	seen := map[string]bool{}
 	var out []protoSvc
 	for _, p := range in {
-		key := p.protocol + "/" + p.serviceID
+		key := fmt.Sprintf("%s/%s/%d", p.protocol, p.serviceID, p.backendPort)
 		if seen[key] {
 			continue
 		}

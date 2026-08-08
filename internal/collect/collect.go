@@ -14,22 +14,28 @@ import (
 	"time"
 
 	"github.com/opscockpit/opscockpit/internal/collector/cgroup"
+	"github.com/opscockpit/opscockpit/internal/collector/firewall"
 	"github.com/opscockpit/opscockpit/internal/collector/host"
 	"github.com/opscockpit/opscockpit/internal/collector/listener"
+	"github.com/opscockpit/opscockpit/internal/collector/nat"
 	"github.com/opscockpit/opscockpit/internal/collector/systemd"
 	svc "github.com/opscockpit/opscockpit/internal/collector/config"
 	"github.com/opscockpit/opscockpit/internal/state"
 	"github.com/opscockpit/opscockpit/internal/topology"
 )
 
-// Runner abstracts the systemd + ss + version command execution. It is the
-// seam tests mock so CI never needs a real host.
+// Runner abstracts the systemd + ss + version + firewall + nat command
+// execution. It is the seam tests mock so CI never needs a real host.
 type Runner interface {
 	systemd.Runner
 	// SS returns `ss -H -lntup` output (or fixture text).
 	SS(ctx context.Context) (string, error)
 	// VersionCommand runs a version argv and returns output.
 	Version(ctx context.Context, argv []string) (string, error)
+	// UFWStatus returns `LC_ALL=C ufw status verbose` output (or fixture text).
+	UFWStatus(ctx context.Context) (string, error)
+	// IptablesNat returns `iptables -t nat -S` output (or fixture text).
+	IptablesNat(ctx context.Context) (string, error)
 }
 
 // Options configures a collection run.
@@ -92,6 +98,10 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 	}
 	listener.SortByPort(sockets)
 
+	// --- firewall + NAT exposure evidence ---
+	fw := firewall.Collect(ctx, r)
+	natStatus := nat.Collect(ctx, r)
+
 	// --- services ---
 	// Map listener → service via PID → cgroup → systemd unit is done by the
 	// caller's Runner in production; this collect step accepts a prebuilt
@@ -144,6 +154,15 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 	unitStateByID := map[string]systemd.UnitStatus{}
 	activeByID := map[string]bool{}
 	requiredListenersByID := map[string][]string{}
+	natIngresses := []topology.NATIngress{}
+
+	// exposureOverride returns the services.yaml exposure hint for a service.
+	exposureOverride := func(id string) *svc.Service {
+		if servicesCfg == nil {
+			return nil
+		}
+		return servicesCfg.ByID(id)
+	}
 
 	for _, sk := range svcSockets {
 		idx, ok := svcIndex[sk.ServiceID]
@@ -151,6 +170,12 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 			continue
 		}
 		entry := &st.Services[idx]
+		svcCfg := exposureOverride(sk.ServiceID)
+
+		// Classify exposure. A wildcard bind is only a binding scope — whether
+		// it is reachable depends on firewall evidence + overrides.
+		exposure := classifyExposure(sk, fw, natStatus, svcCfg)
+
 		entry.Listeners = append(entry.Listeners, state.Listener{
 			Protocol: sk.Protocol,
 			Port:     sk.Port,
@@ -158,6 +183,7 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 			Internal: sk.Internal,
 			PID:      sk.PID,
 			Process:  sk.Process,
+			Exposure: exposure,
 		})
 		topoListeners = append(topoListeners, topology.Listener{
 			ServiceID: sk.ServiceID,
@@ -167,7 +193,59 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 			Internal:  sk.Internal,
 			PID:       sk.PID,
 			Process:   sk.Process,
+			Exposure:  exposure,
 		})
+	}
+
+	// Build NAT ingress → registered service. A public REDIRECT whose target
+	// listener belongs to a registered service becomes a top-level range node.
+	// The target listener itself is marked nat_ingress and suppressed as a
+	// top-level port unless the service forces direct exposure.
+	natTargetByKey := map[string]string{} // "proto:port" → service id
+	for _, l := range topoListeners {
+		natTargetByKey[fmt.Sprintf("%s:%d", l.Protocol, l.Port)] = l.ServiceID
+	}
+
+	for _, ing := range natStatus.PublicRedirects() {
+		targetKey := fmt.Sprintf("%s:%d", ing.Protocol, ing.TargetPort)
+		svcID, ok := natTargetByKey[targetKey]
+		if !ok {
+			// No registered service listens on the target; nothing to expose.
+			continue
+		}
+		natIngresses = append(natIngresses, topology.NATIngress{
+			Protocol:   ing.Protocol,
+			PortStart:  ing.SourcePortStart,
+			PortEnd:    ing.SourcePortEnd,
+			TargetPort: ing.TargetPort,
+			ServiceID:  svcID,
+		})
+
+		// Mark the target listener as nat_ingress (so it won't also render as a
+		// direct top-level port) unless the service forces direct exposure.
+		svcCfg := exposureOverride(svcID)
+		if svcCfg != nil && (svcCfg.ForceDirectPublic() || svcCfg.ExposureMode() == "public") {
+			continue
+		}
+		for i := range topoListeners {
+			l := &topoListeners[i]
+			if l.ServiceID == svcID && l.Protocol == ing.Protocol && l.Port == ing.TargetPort {
+				if l.Exposure == state.ExposureDirectPublic {
+					l.Exposure = state.ExposureNATIngress
+				}
+			}
+		}
+		for i := range st.Services {
+			s := &st.Services[i]
+			if s.ID == svcID {
+				for j := range s.Listeners {
+					ll := &s.Listeners[j]
+					if ll.Protocol == ing.Protocol && ll.Port == ing.TargetPort && ll.Exposure == state.ExposureDirectPublic {
+						ll.Exposure = state.ExposureNATIngress
+					}
+				}
+			}
+		}
 	}
 
 	// Unit state + memory for services with a systemd unit.
@@ -244,6 +322,7 @@ func Collect(ctx context.Context, r Runner, opts Options) (Result, error) {
 	tp, terr := topology.Generate(topology.Input{
 		Services:     topoServices,
 		Listeners:    topoListeners,
+		NATIngresses: natIngresses,
 		Dependencies: deps,
 	}, topology.Options{IncludeInternetRoot: true})
 	if terr != nil {
@@ -304,4 +383,45 @@ func firstLine(s string) string {
 
 func collectorVersion() string {
 	return "dev"
+}
+
+// classifyExposure decides a listener's exposure classification.
+//
+// Rules (highest priority first):
+//  1. services.yaml exposure.mode=internal  → internal (override always wins)
+//  2. services.yaml exposure.mode=public    → direct_public (override)
+//  3. loopback bind (127.0.0.1, ::1)        → internal
+//  4. firewall active + explicit allow for (proto, port) → direct_public
+//  5. firewall active + default deny, no allow            → internal (filtered)
+//  6. firewall unknown/inactive, no override              → unknown
+//
+// A wildcard bind (0.0.0.0, ::) is never public by itself.
+func classifyExposure(s listener.Socket, fw firewall.Status, natStatus nat.Status, svcCfg *svc.Service) string {
+	// Overrides first.
+	if svcCfg != nil {
+		switch svcCfg.ExposureMode() {
+		case "internal":
+			return state.ExposureInternal
+		case "public":
+			return state.ExposureDirectPublic
+		}
+	}
+
+	// Loopback is always internal.
+	if s.Internal {
+		return state.ExposureInternal
+	}
+
+	// Firewall evidence.
+	switch fw.Visibility {
+	case firewall.VisibilityActive:
+		if fw.AllowedIn(s.Protocol, s.Port) {
+			return state.ExposureDirectPublic
+		}
+		// Active firewall but no allow for this port: filtered.
+		return state.ExposureInternal
+	default:
+		// Firewall inactive/missing/unparseable: we cannot claim public.
+		return state.ExposureUnknown
+	}
 }

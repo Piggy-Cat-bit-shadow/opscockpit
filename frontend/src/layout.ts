@@ -5,7 +5,7 @@ import type { TopoNode, TopoEdge } from '@/types'
 // Node sizes per type.
 export const NODE_W = {
   internet: 140,
-  port: 120,
+  port: 150,
   protocol: 96,
   service: 180,
 } as const

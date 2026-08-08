@@ -63,7 +63,9 @@ A single JSON document holding only the current state:
 1. **Linux Runtime Truth** — actual listeners (`ss`), actual memory (cgroup),
    actual unit state (`systemctl show`).
 2. **Current effective config** — config file names/paths as they exist.
-3. **services.yaml override** — friendly names, units, restart permission.
+3. **Firewall + NAT evidence** — whether a port is actually reachable.
+4. **services.yaml override** — friendly names, units, restart permission,
+   exposure classification.
 
 A listener is mapped to a service through the chain:
 
@@ -71,6 +73,41 @@ A listener is mapped to a service through the chain:
 Socket  →  PID  →  cgroup  →  systemd unit  →  service id
 UDP/443 →  1234 →  hysteria-server.service  →  hysteria2
 ```
+
+## Exposure model
+
+A wildcard bind address (0.0.0.0, ::) is only a *binding scope*, not network
+exposure. Whether a port is actually reachable from the internet is decided by
+firewall + NAT evidence, then classified:
+
+| Classification | Meaning |
+|---|---|
+| `direct_public` | firewall explicitly allows (proto, port) — or services.yaml forces public |
+| `nat_ingress` | reachable via a public NAT REDIRECT whose target is this listener (suppressed as a top-level port) |
+| `internal` | loopback bind, or firewall active with default-deny and no allow |
+| `unknown` | firewall/NAT state unknown and no override — never assumed public |
+
+`services.yaml` can override with `exposure.mode: public|internal|nat-target`
+and `force_direct_public`. Default is `auto`.
+
+### NAT ingress
+
+A public REDIRECT with no local listener on the internet-facing port is still a
+real entry point:
+
+```
+Internet
+  └─ 20000–20099   (firewall allows range, iptables REDIRECT → 443)
+      └─ UDP
+          └─ Hysteria2    (backend listener on UDP/443)
+```
+
+- Port nodes carry `port_start`/`port_end` (single or range).
+- The REDIRECT target (backend) is never duplicated as its own top-level port
+  unless the service sets `force_direct_public`.
+- Docker loopback DNAT (`127.0.0.1:3001`) and private-destination redirects are
+  internal, never public ingress.
+- No raw iptables/UFW dumps reach state.json — only normalized exposure facts.
 
 ## Collector modules
 
@@ -81,6 +118,8 @@ UDP/443 →  1234 →  hysteria-server.service  →  hysteria2
 | `cgroup` | cgroup v2 `memory.current`, `/proc/<pid>/status` VmRSS | per-service memory (cgroup → PID-sum → MainPID fallback) |
 | `listener` | `ss -H -lntup` | protocol, bind address, port, pid, process; public vs internal |
 | `docker` | `docker ps` / `docker inspect` | container id, name, image, status, published ports, memory, labels |
+| `firewall` | `LC_ALL=C ufw status verbose` | UFW active/inactive, default policy, ingress ALLOW rules (single port, range, IPv4/v6) |
+| `nat` | `iptables -t nat -S` | public REDIRECT ingresses (range → backend port); loopback/private DNAT ignored |
 | `version` | configured argv (never a shell string), with timeout | service version string |
 | `nginx` | `nginx -T` (minimal parser) | listen + proxy_pass → dependency edges |
 

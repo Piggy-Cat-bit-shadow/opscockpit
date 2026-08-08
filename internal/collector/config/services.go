@@ -33,10 +33,31 @@ type Service struct {
 	Version        *VersionConfig `yaml:"version,omitempty"`
 	RestartEnabled bool           `yaml:"restart_enabled"`
 	Health         *HealthConfig  `yaml:"health,omitempty"`
+	Exposure       *ExposureConfig `yaml:"exposure,omitempty"`
 
 	// StatusHint is populated by the collector at runtime (not from YAML).
 	// It feeds topology node status dots. Not part of the config file.
 	StatusHint string `yaml:"-"`
+}
+
+// ExposureConfig overrides runtime exposure classification for a service.
+// Default mode is "auto" (runtime evidence decides); most services never set
+// this. Fields are only used to override when the runtime evidence is
+// ambiguous or wrong for a specific host.
+type ExposureConfig struct {
+	// Mode is one of: auto (default), public, internal, nat-target.
+	//   auto       — runtime firewall + NAT evidence decides.
+	//   public     — force this service's listeners to be treated as public
+	//                even if firewall evidence is unknown/deny.
+	//   internal   — force this service's listeners internal (never public).
+	//   nat-target — a listener that is a NAT REDIRECT target must NOT become
+	//                a top-level port on its own (see NAT target suppression).
+	Mode string `yaml:"mode"`
+	// ForceDirectPublic, when true, explicitly promotes a NAT-target listener
+	// to a direct public top-level port in addition to its NAT ingress.
+	ForceDirectPublic bool `yaml:"force_direct_public"`
+	// ExposeDirect is an alias for ForceDirectPublic.
+	ExposeDirect bool `yaml:"expose_direct"`
 }
 
 // SystemdConfig carries the unit name for a service.
@@ -173,6 +194,13 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
+		if s.Exposure != nil {
+			switch s.Exposure.Mode {
+			case "", "auto", "public", "internal", "nat-target":
+			default:
+				return fmt.Errorf("services[%d] %q: exposure.mode %q invalid (auto|public|internal|nat-target)", i, s.ID, s.Exposure.Mode)
+			}
+		}
 	}
 	return nil
 }
@@ -241,6 +269,23 @@ func (s *Service) FirstConfigPath() string {
 		return ""
 	}
 	return s.ConfigPaths[0]
+}
+
+// ExposureMode returns the configured exposure mode ("auto" when unset).
+func (s *Service) ExposureMode() string {
+	if s.Exposure == nil || s.Exposure.Mode == "" {
+		return "auto"
+	}
+	return s.Exposure.Mode
+}
+
+// ForceDirectPublic reports whether this service's NAT-target listeners must
+// also appear as direct public top-level ports.
+func (s *Service) ForceDirectPublic() bool {
+	if s.Exposure == nil {
+		return false
+	}
+	return s.Exposure.ForceDirectPublic || s.Exposure.ExposeDirect
 }
 
 // DefaultConfig returns the default services.yaml content used as an example.

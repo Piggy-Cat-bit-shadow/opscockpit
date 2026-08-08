@@ -32,14 +32,14 @@ function ServiceLeaf({
 
 export function MobileTopology({ state, selectedId, onSelectService }: Props) {
   const tree = useMemo(() => buildPortTree(state.topology), [state.topology])
-  const [openPorts, setOpenPorts] = useState<Set<number>>(() => new Set(tree.map((p) => p.port)))
+  const [openPorts, setOpenPorts] = useState<Set<string>>(() => new Set(tree.map((p) => p.label)))
   const [openProtos, setOpenProtos] = useState<Set<string>>(() => new Set())
 
-  const togglePort = (port: number) => {
+  const togglePort = (label: string) => {
     setOpenPorts((prev) => {
       const next = new Set(prev)
-      if (next.has(port)) next.delete(port)
-      else next.add(port)
+      if (next.has(label)) next.delete(label)
+      else next.add(label)
       return next
     })
   }
@@ -61,16 +61,16 @@ export function MobileTopology({ state, selectedId, onSelectService }: Props) {
     <div className="oc-tree">
       <div className="oc-tree-internet">Internet</div>
       {tree.map((p) => {
-        const open = openPorts.has(p.port)
+        const open = openPorts.has(p.label)
         return (
-          <div key={p.port} className="oc-tree-port">
-            <button className="oc-tree-port-head" onClick={() => togglePort(p.port)}>
+          <div key={p.label} className="oc-tree-port">
+            <button className="oc-tree-port-head" onClick={() => togglePort(p.label)}>
               {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-              <span className="oc-tree-port-num">{p.port}</span>
+              <span className="oc-tree-port-num">{p.label}</span>
             </button>
             {open &&
               p.protocols.map((pr) => {
-                const key = `${p.port}-${pr.protocol}`
+                const key = `${p.label}-${pr.protocol}`
                 const openP = openProtos.has(key)
                 return (
                   <div key={key} className="oc-tree-proto">

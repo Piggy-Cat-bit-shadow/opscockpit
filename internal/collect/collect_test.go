@@ -17,11 +17,14 @@ import (
 //   - systemd unit show returns active states
 //   - version commands return version strings
 //   - PID → service id mapping
+//   - UFW and iptables nat fixtures
 type mockRunner struct {
 	ssText   string
 	units    map[string]string
 	pidToSvc map[int]string
 	versions map[string]string // argv[0] → version
+	ufwText  string
+	natText  string
 }
 
 func (m *mockRunner) Run(ctx context.Context, argv []string) (string, error) {
@@ -36,6 +39,20 @@ func (m *mockRunner) RunUnit(ctx context.Context, unit string, properties []stri
 }
 
 func (m *mockRunner) SS(ctx context.Context) (string, error) { return m.ssText, nil }
+
+func (m *mockRunner) UFWStatus(ctx context.Context) (string, error) {
+	if m.ufwText == "" {
+		return "", nil
+	}
+	return m.ufwText, nil
+}
+
+func (m *mockRunner) IptablesNat(ctx context.Context) (string, error) {
+	if m.natText == "" {
+		return "", nil
+	}
+	return m.natText, nil
+}
 
 func (m *mockRunner) Version(ctx context.Context, argv []string) (string, error) {
 	if len(argv) == 0 {
@@ -147,6 +164,20 @@ func defaultMockRunner() *mockRunner {
 			"/usr/local/bin/hysteria": "Hysteria 2.5.0\n",
 			"/usr/local/bin/xray":     "Xray 24.9.1\n",
 		},
+		ufwText: `Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+443/tcp                    ALLOW IN    Anywhere
+443/udp                    ALLOW IN    Anywhere
+853/tcp                    ALLOW IN    Anywhere
+853/udp                    ALLOW IN    Anywhere
+8443/udp                   ALLOW IN    Anywhere
+`,
 	}
 }
 

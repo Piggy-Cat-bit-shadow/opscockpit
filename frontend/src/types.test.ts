@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildPortTree, sortServices, formatBytes, formatDuration } from '@/types'
+import { buildPortTree, sortServices, formatBytes, formatDuration, formatPortRange } from '@/types'
 import type { Service, Status, Topology } from '@/types'
 
 function svc(id: string, name: string, status: Status, ram?: number): Service {
@@ -64,5 +64,38 @@ describe('formatDuration', () => {
     expect(formatDuration(30)).toBe('0m 30s')
     expect(formatDuration(3661)).toBe('1h 1m')
     expect(formatDuration(90000)).toBe('1d 1h')
+  })
+})
+
+describe('formatPortRange', () => {
+  it('renders single vs range', () => {
+    expect(formatPortRange(443, 443)).toBe('443')
+    expect(formatPortRange(20000, 20099)).toBe('20000–20099')
+  })
+})
+
+describe('buildPortTree with ranges', () => {
+  const topology: Topology = {
+    nodes: [
+      { id: 'port-20000-20099', type: 'port', label: '20000–20099', port_start: 20000, port_end: 20099 },
+      { id: 'port-20000-20099-udp', type: 'protocol', label: 'UDP', protocol: 'udp', port_start: 20000, port_end: 20099 },
+      { id: 'hysteria2@udp:443', type: 'service', label: 'Hysteria2', service_id: 'hysteria2', protocol: 'udp', port: 443, port_start: 20000, port_end: 20099, status: 'healthy' },
+      { id: 'port-8554', type: 'port', label: '8554', port: 8554, port_start: 8554, port_end: 8554 },
+      { id: 'port-8554-udp', type: 'protocol', label: 'UDP', protocol: 'udp', port: 8554, port_start: 8554, port_end: 8554 },
+      { id: 'snell@udp:17414', type: 'service', label: 'Snell', service_id: 'snell', protocol: 'udp', port: 17414, port_start: 8554, port_end: 8554, status: 'healthy' },
+    ],
+    edges: [],
+  }
+
+  it('keys on range and sorts ranges before singles by start', () => {
+    const tree = buildPortTree(topology)
+    // 8554 (start 8554) sorts before 20000-20099 (start 20000).
+    expect(tree.map((p) => p.label)).toEqual(['8554', '20000–20099'])
+    expect(tree[0].portStart).toBe(8554)
+    expect(tree[0].portEnd).toBe(8554)
+    expect(tree[1].portStart).toBe(20000)
+    expect(tree[1].portEnd).toBe(20099)
+    // The range service still exposes its backend port.
+    expect(tree[1].protocols[0].services[0].serviceId).toBe('hysteria2')
   })
 })

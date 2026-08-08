@@ -66,6 +66,28 @@ services:
       timeout: 5s
     restart_enabled: true
 
+  - id: snell
+    name: Snell
+    systemd:
+      unit: snell.service
+    config_paths:
+      - /etc/snell/config.toml
+    version:
+      command:
+        - /usr/local/bin/snell-server
+        - --version
+      timeout: 5s
+    restart_enabled: true
+    # Optional exposure override. Default is "auto" (runtime firewall + NAT
+    # evidence decides). Most services never set this.
+    #   mode: public       — force listeners public even if firewall unknown
+    #   mode: internal     — force listeners internal (never public)
+    #   mode: nat-target   — this service is a NAT REDIRECT backend; its
+    #                        listener must NOT become a top-level port.
+    #   force_direct_public: true — also expose the NAT backend directly.
+    # exposure:
+    #   mode: auto
+
   - id: xray
     name: Xray
     systemd:

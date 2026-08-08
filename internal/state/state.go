@@ -8,6 +8,7 @@
 package state
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -115,7 +116,27 @@ type Listener struct {
 	Internal bool   `json:"internal"`
 	PID      int    `json:"pid,omitempty"`
 	Process  string `json:"process,omitempty"`
+	// Exposure classifies how this listener is reachable. A wildcard bind
+	// address alone does NOT make a listener public — firewall evidence and
+	// services.yaml overrides decide.
+	Exposure string `json:"exposure,omitempty"`
 }
+
+// Exposure classifications.
+const (
+	// ExposureDirectPublic: a registered service listener reachable from the
+	// internet (firewall allows it, or services.yaml forces public).
+	ExposureDirectPublic = "direct_public"
+	// ExposureNATIngress: reachable via a public NAT ingress (REDIRECT) whose
+	// target is this listener. Never rendered as a second top-level port.
+	ExposureNATIngress = "nat_ingress"
+	// ExposureInternal: loopback-only or filtered by firewall. Never a public
+	// port.
+	ExposureInternal = "internal"
+	// ExposureUnknown: firewall/nat state unknown and no override — do not
+	// assume public.
+	ExposureUnknown = "unknown"
+)
 
 // Health is the machine-wide health summary.
 type Health struct {
@@ -146,7 +167,8 @@ const (
 	NodeService   = "service"
 )
 
-// Node is one node in the port tree.
+// Node is one node in the port tree. A Port node may represent a single port
+// (Port == PortEnd) or a range (PortStart..PortEnd).
 type Node struct {
 	ID        string `json:"id"`
 	Type      string `json:"type"`
@@ -154,7 +176,20 @@ type Node struct {
 	ServiceID string `json:"service_id,omitempty"`
 	Protocol  string `json:"protocol,omitempty"`
 	Port      int    `json:"port,omitempty"`
+	PortStart int    `json:"port_start,omitempty"`
+	PortEnd   int    `json:"port_end,omitempty"`
 	Status    string `json:"status,omitempty"`
+	Exposure  string `json:"exposure,omitempty"`
+	// TargetPort is set on a NAT ingress port node (the backend listener port).
+	TargetPort int `json:"target_port,omitempty"`
+}
+
+// PortLabel renders a port node label: single port or "start–end".
+func PortLabel(start, end int) string {
+	if start == end {
+		return fmt.Sprintf("%d", start)
+	}
+	return fmt.Sprintf("%d–%d", start, end)
 }
 
 // Edge is one directed edge in the port tree.
@@ -181,6 +216,8 @@ const (
 	EvidenceDockerPort      = "docker_port"
 	EvidenceManualOverride  = "manual_override"
 	EvidenceDependency      = "dependency"
+	EvidenceIptablesRedirect = "iptables_redirect"
+	EvidenceFirewall         = "firewall_ufw"
 
 	ConfidenceConfirmed = "confirmed"
 	ConfidenceConfigured = "configured"
