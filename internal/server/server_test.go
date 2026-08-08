@@ -236,10 +236,14 @@ func TestHandleRestartCooldown(t *testing.T) {
 
 func TestHandleRestartUnavailable(t *testing.T) {
 	// A serve without a configured helper must return explicit unavailable,
-	// never silently succeed.
+	// never silently succeed. The broker knows hysteria2 is restart-enabled
+	// (from state.json) but the backend reports unavailable.
 	raw, _ := json.Marshal(testState(true))
 	store := &memStore{st: testState(true), raw: raw}
-	s := New(store, restart.NewBroker(nil, restart.NewUnavailableBackend()), http.NotFoundHandler(), false, nil)
+	broker := restart.NewBrokerCooldown([]restart.Entry{
+		{ID: "hysteria2", Unit: "hysteria-server.service", RestartEnabled: true},
+	}, restart.NewUnavailableBackend(), 0)
+	s := New(store, broker, http.NotFoundHandler(), false, nil)
 
 	req := httptest.NewRequest("POST", "/api/services/hysteria2/restart", nil)
 	req.Header.Set("X-OpsCockpit-Action", "restart")
